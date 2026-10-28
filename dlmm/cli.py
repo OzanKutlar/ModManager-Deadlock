@@ -11,6 +11,7 @@ from rich.progress import BarColumn, DownloadColumn, Progress, TimeRemainingColu
 
 from . import __version__, archives, backups, gameinfo, installer, manifest, protocol
 from .archives import ExtractedVpk
+from .config import get_setting, set_setting
 from .errors import DlmmError
 from .fsutil import format_age, format_size
 from .game_paths import find_game
@@ -21,6 +22,11 @@ from .picker import PickItem, confirm, pause, pick
 from .ui import console, dim, fail, info, ok, rule, warn
 
 MAX_MENU_ROUNDS = 200
+PROTOCOL_PROMPT_SETTING = 'protocol_prompt_answered'
+PROTOCOL_PROMPT = (
+    "Do you want to let this tool take over deadlock mod manager's url? "
+    'so you can download one click from sites like banana'
+)
 DOWNLOADS_GUID = '{374DE290-123F-4565-9164-39C4925E467B}'
 SHELL_FOLDERS_KEY = r'Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders'
 MENU_ACTIONS = (
@@ -312,6 +318,7 @@ def cmd_unpatch(args) -> int:
 
 def cmd_register(args) -> int:
     previous = protocol.register()
+    set_setting(PROTOCOL_PROMPT_SETTING, None)
     ok('deadlock-mod-manager: links now open dlmm.')
     if previous:
         dim(f'Previous handler saved; unregister restores it: {escape(previous)}')
@@ -320,7 +327,9 @@ def cmd_register(args) -> int:
 
 
 def cmd_unregister(args) -> int:
-    ok(f'Unregister: {escape(protocol.unregister())}')
+    result = protocol.unregister()
+    set_setting(PROTOCOL_PROMPT_SETTING, True)
+    ok(f'Unregister: {escape(result)}')
     return 0
 
 
@@ -393,6 +402,38 @@ def _warn_if_unpatched(args) -> None:
         ok('gameinfo.gi patched (backup saved).')
 
 
+def _remember_prompt_declined() -> None:
+    try:
+        set_setting(PROTOCOL_PROMPT_SETTING, True)
+    except DlmmError as e:
+        warn(f'Could not save your answer: {escape(str(e))}')
+
+
+def _offer_protocol_takeover() -> None:
+    """Ask once (Windows, interactive menu only) whether dlmm should handle 1-click links."""
+    if sys.platform != 'win32':
+        return
+    try:
+        if get_setting(PROTOCOL_PROMPT_SETTING) is not None:
+            return
+        command = protocol.read_command()
+    except DlmmError as e:
+        warn(f'Could not check the 1-click handler: {escape(str(e))}')
+        return
+    if protocol.is_ours(command):
+        return
+    if command:
+        dim('1-click links currently open another app; it will be backed up and unregister restores it.')
+    if not confirm(PROTOCOL_PROMPT, default=True):
+        _remember_prompt_declined()
+        dim('No problem. You can enable it later with: python deadlock_mm.py register')
+        return
+    try:
+        cmd_register(None)
+    except DlmmError as e:
+        warn(f'Could not register the 1-click handler: {escape(str(e))}')
+
+
 def _run_menu_command(command: str, args) -> None:
     sub_args = argparse.Namespace(game_dir=args.game_dir, downloads=args.downloads, archive=None, name=None)
     try:
@@ -403,6 +444,7 @@ def _run_menu_command(command: str, args) -> None:
 
 def interactive(args) -> int:
     console.print(Panel(f'Deadlock Lite Mod Manager [dim]v{__version__}[/dim]', border_style='blue'))
+    _offer_protocol_takeover()
     _warn_if_unpatched(args)
     items = [PickItem(label, '', command) for label, command in MENU_ACTIONS]
     items.append(PickItem('Quit', '', None))
