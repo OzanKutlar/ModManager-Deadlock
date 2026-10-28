@@ -212,6 +212,13 @@ def add_mod(mod: InstalledMod) -> None:
     _save([*mods, mod])
 
 
+def save_mods(mods: list[InstalledMod]) -> None:
+    """Replace the whole manifest in one atomic write."""
+    if not all(isinstance(m, InstalledMod) for m in mods):
+        raise InstallError('Invalid mod record.')
+    _save(list(mods))
+
+
 def remove_mod(mod_id: str) -> None:
     _save([m for m in load_mods() if m.mod_id != mod_id])
 

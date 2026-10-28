@@ -19,7 +19,8 @@ pip install -r requirements.txt
 | `enable [name]` / `disable [name]` / `toggle` | Switch mods on or off without deleting them |
 | `group` / `group list` / `group switch [group]` | Manage groups; only one mod per group is active |
 | `group assign [mod]` / `group set <mod> <group>` / `group clear <mod>` | Put mods in groups or take them out |
-| `conflicts` | Find enabled mods that replace the same files |
+| `conflicts [--reset-ignored]` | Find enabled mods that replace the same files, and mods installed twice |
+| `merge [target]` / `install --into <mod>` | Combine mods into one, e.g. a skin and its separately downloaded voicelines |
 | `uninstall [name]` | Remove a mod's files (backups are kept) |
 | `list` / `status` | Show mods by group / show the environment |
 | `rollback` | Restore any backed-up file |
@@ -40,7 +41,13 @@ Disabled mods are not deleted. Their files are moved to `game/citadel/dlmm_disab
 
 ## Conflicts
 
-dlmm reads each VPK's internal file list. When two enabled mods that aren't in the same group replace the same files, it shows which files overlap and offers to group the two mods.
+dlmm reads each VPK's internal file list. When two enabled mods that aren't in the same group replace the same game files, it shows which files overlap. You can then group the two mods, skip the pair for now, ignore it permanently, or stop checking.
+
+Some files don't count as conflicts: readme, license, credits and changelog files, and root-level files that aren't compiled resources (`*_c`).
+
+## Combining mods
+
+Use `merge` to fold separately downloaded parts, such as voicelines, into one mod. They are then enabled, disabled, grouped and uninstalled together. You can also add an archive directly to an existing mod with `install --into <mod>`.
 
 ## What it changes on disk
 

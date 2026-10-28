@@ -4,16 +4,14 @@ Only one mod per group may be enabled: enabling one disables the other members.
 Every move is hash-checked and all-or-nothing per mod (partial moves are rolled back).
 """
 
-import os
 import re
 from dataclasses import dataclass, replace
-from pathlib import Path
 
 from rich.markup import escape
 
 from . import manifest, ui
 from .errors import ConfigError, InstallError
-from .fsutil import copy_atomic, sha256_file
+from .fileops import MovePlan, move_all, undo_moves
 from .installer import SLOT_RE, free_slot_names, remove_empty_dir, used_slots
 from .manifest import InstalledMod
 
@@ -25,8 +23,6 @@ STOP_WORDS = frozenset({
     'version', 'with', 'remake', 'remastered', 'pack', 'zip', 'rar', 'final', 'fix', 'fixed',
     'update', 'updated', 'edition', 'custom', 'replacement', 'replace', 'model', 'models',
 })
-
-MovePlan = list[tuple[Path, Path, str]]
 
 
 @dataclass(frozen=True)
@@ -45,56 +41,14 @@ def _fresh(mod: InstalledMod) -> InstalledMod:
 
 
 # ----------------------------------------------------------------------
-# File moves
+# State changes
 # ----------------------------------------------------------------------
-
-def _copy_verify_unlink(source: Path, target: Path, expected_sha: str) -> None:
-    """Fallback when a rename is impossible (e.g. different drives)."""
-    copy_atomic(source, target)
-    if sha256_file(target) != expected_sha:
-        target.unlink()
-        raise InstallError(f'Copy of {source.name} is corrupt; original left in place.')
-    source.unlink()
-
-
-def _move_file(source: Path, target: Path, expected_sha: str) -> None:
-    if not source.is_file():
-        raise InstallError(f'Missing file: {source}')
-    if target.exists():
-        raise InstallError(f'Refusing to overwrite existing file: {target}')
-    if sha256_file(source) != expected_sha:
-        raise InstallError(f'{source.name} changed since install; not moving it.')
-    target.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        os.replace(source, target)
-    except OSError:
-        _copy_verify_unlink(source, target, expected_sha)
-
-
-def _undo_moves(done: MovePlan) -> None:
-    for source, target, sha in reversed(done):
-        try:
-            _move_file(target, source, sha)
-        except (InstallError, OSError) as e:
-            ui.warn(f'Could not move {escape(str(target))} back: {escape(str(e))}')
-
-
-def _move_all(plan: MovePlan) -> None:
-    done: MovePlan = []
-    try:
-        for step in plan:
-            _move_file(*step)
-            done.append(step)
-    except (InstallError, OSError) as e:
-        _undo_moves(done)
-        raise InstallError(f'{e} (no files were changed)') from e
-
 
 def _commit(updated: InstalledMod, plan: MovePlan) -> InstalledMod:
     try:
         manifest.replace_mod(updated)
     except ConfigError as e:
-        _undo_moves(plan)
+        undo_moves(plan)
         raise InstallError(f'Could not save the new state; files were moved back: {e}') from e
     return updated
 
@@ -105,7 +59,7 @@ def _commit(updated: InstalledMod, plan: MovePlan) -> InstalledMod:
 
 def _disable_files(current: InstalledMod) -> InstalledMod:
     plan = [(current.addons / f.slot, current.parking / f.slot, f.sha256) for f in current.files]
-    _move_all(plan)
+    move_all(plan)
     return _commit(replace(current, enabled=False), plan)
 
 
@@ -133,7 +87,7 @@ def _enable_files(current: InstalledMod) -> InstalledMod:
     except OSError as e:
         raise InstallError(f'Cannot create {current.addons}: {e}') from e
     plan = [(current.parking / f.slot, current.addons / slot, f.sha256) for f, slot in zip(current.files, slots)]
-    _move_all(plan)
+    move_all(plan)
     files = tuple(replace(f, slot=slot) for f, slot in zip(current.files, slots))
     updated = _commit(replace(current, enabled=True, files=files), plan)
     remove_empty_dir(current.parking)
@@ -186,6 +140,19 @@ def enable(mod: InstalledMod) -> ToggleResult:
     return ToggleResult(updated, disabled)
 
 
+def fresh(mod: InstalledMod) -> InstalledMod:
+    """Latest manifest record of `mod`."""
+    return _fresh(mod)
+
+
+def move_to_state(mod: InstalledMod, enabled: bool) -> InstalledMod:
+    """Move a mod's files to match `enabled` without group handling (used by merges)."""
+    current = _fresh(mod)
+    if current.enabled == enabled:
+        return current
+    return _enable_files(current) if enabled else _disable_files(current)
+
+
 def disable_group(group: str) -> list[InstalledMod]:
     members = manifest.group_members(manifest.load_mods(), group)
     return [disable(m) for m in members if m.enabled]
@@ -215,6 +182,11 @@ def _match_score(group: str, words: set[str], flat: str) -> int:
         if word in words or (len(word) >= MIN_SUBSTRING_LEN and word in flat):
             score += 1
     return score
+
+
+def name_words(text: str) -> set[str]:
+    """Meaningful lower-case words of a name (camelCase and separators split, stop words removed)."""
+    return _words(text)
 
 
 def suggest_groups(mods: list[InstalledMod], *names: str) -> list[tuple[str, bool]]:

@@ -9,7 +9,7 @@ from rich.markup import escape
 from rich.panel import Panel
 from rich.progress import BarColumn, DownloadColumn, Progress, TimeRemainingColumn, TransferSpeedColumn
 
-from . import __version__, archives, backups, conflicts, gameinfo, installer, manifest, protocol, toggler
+from . import __version__, archives, backups, conflicts, gameinfo, installer, manifest, merger, protocol, toggler
 from .archives import ExtractedVpk
 from .config import get_setting, set_setting
 from .errors import DlmmError
@@ -33,10 +33,20 @@ SHELL_FOLDERS_KEY = r'Software\Microsoft\Windows\CurrentVersion\Explorer\User Sh
 NEW_GROUP = object()
 NO_GROUP = object()
 DISABLE_ALL = object()
+DONE = object()
+IGNORED_CONFLICTS_SETTING = 'ignored_conflicts'
+CONFLICT_GROUP, CONFLICT_SKIP, CONFLICT_IGNORE, CONFLICT_STOP = 'group', 'skip', 'ignore', 'stop'
+CONFLICT_ACTIONS = (
+    ('Put them in the same group', CONFLICT_GROUP),
+    ('Not now', CONFLICT_SKIP),
+    ('Ignore this pair from now on', CONFLICT_IGNORE),
+    ('Skip the remaining conflicts', CONFLICT_STOP),
+)
 MENU_ACTIONS = (
     ('Install mod from Downloads', 'install'),
     ('Enable / disable mods', 'toggle'),
     ('Mod groups', 'group'),
+    ('Combine mods', 'merge'),
     ('Uninstall mod', 'uninstall'),
     ('List installed mods', 'list'),
     ('Check for conflicts', 'conflicts'),
@@ -53,7 +63,6 @@ SIMPLE_COMMANDS = (
     ('list', 'List installed mods by group'),
     ('status', 'Show game path, patch state, tools, conflicts and backups'),
     ('toggle', 'Enable/disable mods from a picker'),
-    ('conflicts', 'Find enabled mods that replace the same files'),
     ('rollback', 'Restore a backed-up file'),
     ('patch', 'Make gameinfo.gi load citadel/addons (after game updates)'),
     ('unpatch', 'Remove the addons entry from gameinfo.gi'),
@@ -89,6 +98,14 @@ def _ask_text(prompt: str) -> str | None:
             return answer
         warn('Please type a name (Ctrl+C cancels).')
     return None
+
+
+def _ask_optional_text(prompt: str) -> str | None:
+    try:
+        answer = console.input(f'[bold]{escape(prompt)}[/bold] ').strip()
+    except (KeyboardInterrupt, EOFError):
+        return None
+    return answer or None
 
 
 def choose_vpks(vpks: list[ExtractedVpk]) -> list[ExtractedVpk]:
@@ -301,8 +318,31 @@ GROUP_HANDLERS = {
 # Conflicts
 # ----------------------------------------------------------------------
 
+def _mod_label(mod: InstalledMod) -> str:
+    where = mod.slots if mod.enabled else 'disabled'
+    return f'{mod.name} ({where})'
+
+
+def _load_ignored() -> set[tuple[str, str]]:
+    raw = get_setting(IGNORED_CONFLICTS_SETTING, [])
+    if not isinstance(raw, list):
+        return set()
+    pairs: set[tuple[str, str]] = set()
+    for pair in raw:
+        if isinstance(pair, list) and len(pair) == 2 and all(isinstance(x, str) for x in pair):
+            first, second = sorted(pair)
+            pairs.add((first, second))
+    return pairs
+
+
+def _ignore_pair(a: InstalledMod, b: InstalledMod) -> None:
+    ignored = _load_ignored() | {conflicts.pair_key(a, b)}
+    set_setting(IGNORED_CONFLICTS_SETTING, sorted([list(p) for p in ignored]))
+    dim('Pair ignored. Reset with: python deadlock_mm.py conflicts --reset-ignored')
+
+
 def _report_conflict(a: InstalledMod, b: InstalledMod, conflict: conflicts.Conflict) -> None:
-    warn(f'[bold]{escape(a.name)}[/bold] and [bold]{escape(b.name)}[/bold] '
+    warn(f'[bold]{escape(_mod_label(a))}[/bold] and [bold]{escape(_mod_label(b))}[/bold] '
          f'both replace {conflict.count} file(s):')
     for path in conflict.sample:
         dim(f'    {escape(path)}')
@@ -321,9 +361,13 @@ def _fresh_pair(conflict: conflicts.Conflict) -> tuple[InstalledMod, InstalledMo
     return a, b
 
 
-def _offer_group_for_conflict(a: InstalledMod, b: InstalledMod) -> None:
-    if not confirm(f'Put {a.name} and {b.name} in the same group so only one is active?', default=True):
-        return
+def _ask_conflict_action(a: InstalledMod, b: InstalledMod) -> str:
+    items = [PickItem(label, '', key) for label, key in CONFLICT_ACTIONS]
+    choice = pick(f'{_mod_label(a)} / {_mod_label(b)}: what should happen?', items)
+    return choice.value if choice else CONFLICT_STOP
+
+
+def _group_pair(a: InstalledMod, b: InstalledMod) -> None:
     group = a.group or b.group
     if group is None:
         chosen, group = _pick_group(manifest.load_mods(), f'Group for {a.name} and {b.name}', (a.name, b.name))
@@ -337,6 +381,8 @@ def _offer_group_for_conflict(a: InstalledMod, b: InstalledMod) -> None:
 
 
 def _handle_conflicts(report: conflicts.ConflictReport) -> int:
+    if report.conflicts:
+        warn(f'{len(report.conflicts)} conflict(s) between enabled mods.')
     handled = 0
     for conflict in report.conflicts:
         pair = _fresh_pair(conflict)
@@ -344,12 +390,18 @@ def _handle_conflicts(report: conflicts.ConflictReport) -> int:
             continue
         handled += 1
         _report_conflict(*pair, conflict)
-        _offer_group_for_conflict(*pair)
+        action = _ask_conflict_action(*pair)
+        if action == CONFLICT_STOP:
+            break
+        if action == CONFLICT_GROUP:
+            _group_pair(*pair)
+        elif action == CONFLICT_IGNORE:
+            _ignore_pair(*pair)
     return handled
 
 
 def _check_conflicts(only_with: InstalledMod | None = None) -> None:
-    report = conflicts.find_conflicts(manifest.load_mods(), only_with)
+    report = conflicts.find_conflicts(manifest.load_mods(), only_with, _load_ignored())
     if report.unreadable:
         dim(f'{len(report.unreadable)} VPK file(s) could not be read for conflict checks (run: conflicts).')
     _handle_conflicts(report)
@@ -386,17 +438,40 @@ def _report_install(record: InstalledMod) -> None:
         dim('Restart Deadlock if it is running.')
 
 
+def _confirm_duplicate(existing: InstalledMod) -> bool:
+    return confirm(f'Already installed as {_mod_label(existing)} - install anyway?', default=False)
+
+
+def _install_into(archive: Path, name: str, game, mods: list[InstalledMod], query: str) -> int:
+    target = _select_mod(mods, query, 'Add files to which mod?', 'No mods installed by dlmm.')
+    if target is None:
+        return 1
+    request = InstallRequest(archive, name, into_mod_id=target.mod_id)
+    rule(f'Adding {escape(archive.name)} to {escape(target.name)}')
+    record = installer.install(request, game, choose_vpks, _confirm_duplicate)
+    if record is None:
+        warn('Install cancelled; nothing changed.')
+        return 0
+    ok(f'{escape(record.name)} now has {len(record.files)} files')
+    if record.enabled:
+        _check_conflicts(record)
+    return 0
+
+
 def _install_flow(archive: Path, name: str, args, gamebanana_ids: tuple = (None, None)) -> int:
     game = find_game(args.game_dir)
     mods = manifest.load_mods()
+    into = getattr(args, 'into', None)
+    if into:
+        return _install_into(archive, name, game, mods, into)
     group = _group_for_install(args, mods, name, archive.name)
     rivals = [m for m in manifest.group_members(mods, group) if m.enabled]
     enabled = _confirm_takeover(group, rivals)
     request = InstallRequest(archive, name, gamebanana_ids[0], gamebanana_ids[1], group=group, enabled=enabled)
     rule(f'Installing {escape(name)}')
-    record = installer.install(request, game, choose_vpks)
+    record = installer.install(request, game, choose_vpks, _confirm_duplicate)
     if record is None:
-        warn('Nothing selected; install cancelled.')
+        warn('Install cancelled; nothing changed.')
         return 0
     if record.enabled and record.group:
         for other in toggler.enable(record).disabled_others:
@@ -534,12 +609,72 @@ def cmd_list(args) -> int:
     return _group_list(args)
 
 
+def _offer_duplicate_cleanup(mods: list[InstalledMod]) -> None:
+    for older, newer in conflicts.find_duplicates(mods):
+        warn(f'{escape(_mod_label(newer))} has the same files as {escape(_mod_label(older))} (installed twice).')
+        if not confirm(f'Uninstall the newer copy ({newer.name})?', default=True):
+            continue
+        result = installer.uninstall(newer)
+        for slot in result.removed:
+            ok(f'Removed {escape(slot)} (backup kept)')
+        for note in result.skipped:
+            warn(f'Skipped {escape(note)}')
+
+
 def cmd_conflicts(args) -> int:
-    report = conflicts.find_conflicts(manifest.load_mods())
+    if getattr(args, 'reset_ignored', False):
+        set_setting(IGNORED_CONFLICTS_SETTING, None)
+        ok('Ignored conflict pairs cleared.')
+    _offer_duplicate_cleanup(manifest.load_mods())
+    report = conflicts.find_conflicts(manifest.load_mods(), None, _load_ignored())
     for problem in report.unreadable:
         dim(f'Unreadable: {escape(problem)}')
     if _handle_conflicts(report) == 0:
         ok('No enabled mods replace the same files.')
+    return 0
+
+
+def _pick_merge_sources(mods: list[InstalledMod], target: InstalledMod) -> list[InstalledMod]:
+    chosen: list[InstalledMod] = []
+    for _ in range(merger.MAX_SOURCES):
+        taken = {m.mod_id for m in chosen}
+        remaining = [(m, hit) for m, hit in merger.merge_candidates(mods, target) if m.mod_id not in taken]
+        if not remaining:
+            return chosen
+        items = [PickItem(f'Done ({len(chosen)} selected)', '', DONE)]
+        items.extend(
+            PickItem(f'{m.mark} {m.name}', ('similar name · ' if hit else '') + m.hint, m) for m, hit in remaining
+        )
+        choice = pick(f'Combine into {target.name}: pick mods, then Done', items, default_index=0 if chosen else 1)
+        if choice is None:
+            return []
+        if choice.value is DONE:
+            return chosen
+        chosen.append(choice.value)
+    return chosen
+
+
+def cmd_merge(args) -> int:
+    mods = manifest.load_mods()
+    if len(mods) < 2:
+        info('You need at least two installed mods to combine.')
+        return 0
+    title = 'Select the mod to keep (others are merged into it)'
+    target = _select_mod(mods, getattr(args, 'target', None), title, 'No mods installed by dlmm.')
+    if target is None:
+        return 0
+    sources = _pick_merge_sources(mods, target)
+    if not sources:
+        warn('Nothing selected; nothing changed.')
+        return 0
+    names = ', '.join(s.name for s in sources)
+    if not confirm(f'Combine {names} into {target.name}?', default=True):
+        warn('Cancelled.')
+        return 0
+    new_name = _ask_optional_text(f'Name for the combined mod (Enter keeps {target.name}):')
+    record = merger.merge(target, sources, new_name)
+    where = record.slots if record.enabled else 'disabled'
+    ok(f'Combined into [bold]{escape(record.name)}[/bold]: {len(record.files)} files ({escape(where)})')
     return 0
 
 
@@ -560,9 +695,12 @@ def _status_mods(mods: list[InstalledMod]) -> None:
         active = [m for m in manifest.group_members(mods, group) if m.enabled]
         if len(active) > 1:
             warn(f'Group {escape(group)} has {len(active)} enabled mods (run: group switch).')
-    report = conflicts.find_conflicts(mods)
+    report = conflicts.find_conflicts(mods, None, _load_ignored())
     if report.conflicts:
         warn(f'{len(report.conflicts)} conflict(s) between enabled mods (run: conflicts).')
+    duplicates = conflicts.find_duplicates(mods)
+    if duplicates:
+        warn(f'{len(duplicates)} mod(s) installed twice (run: conflicts).')
 
 
 def _status_game(args) -> None:
@@ -739,6 +877,7 @@ COMMANDS = {
     'group': cmd_group,
     'list': cmd_list,
     'conflicts': cmd_conflicts,
+    'merge': cmd_merge,
     'status': cmd_status,
     'rollback': cmd_rollback,
     'patch': cmd_patch,
@@ -809,6 +948,7 @@ def _menu_args(args) -> argparse.Namespace:
     return argparse.Namespace(
         game_dir=args.game_dir, downloads=args.downloads, archive=None, name=None,
         group=None, no_group=False, group_action=None, mod=None,
+        reset_ignored=False, into=None, target=None,
     )
 
 
@@ -844,6 +984,7 @@ def _add_install_parser(sub) -> None:
     grouping = install.add_mutually_exclusive_group()
     grouping.add_argument('--group', help='Put the mod in this group (skips the group prompt)')
     grouping.add_argument('--no-group', dest='no_group', action='store_true', help='Do not ask about groups')
+    grouping.add_argument('--into', metavar='MOD', help='Add the files to this existing mod instead')
 
 
 def _add_group_parser(sub) -> None:
@@ -876,6 +1017,11 @@ def build_parser() -> argparse.ArgumentParser:
         named = sub.add_parser(name, help=text)
         named.add_argument('name', nargs='?', help='Mod name (picker if omitted)')
     _add_group_parser(sub)
+    merge = sub.add_parser('merge', help='Combine mods into one (e.g. a skin and its voicelines)')
+    merge.add_argument('target', nargs='?', help='Mod to keep (picker if omitted)')
+    conflicts_parser = sub.add_parser('conflicts', help='Find enabled mods that replace the same files')
+    conflicts_parser.add_argument('--reset-ignored', dest='reset_ignored', action='store_true',
+                                  help='Forget pairs marked as ignored')
     handle = sub.add_parser('handle', help='Handle a deadlock-mod-manager: 1-click link')
     handle.add_argument('url')
     for name, text in SIMPLE_COMMANDS:

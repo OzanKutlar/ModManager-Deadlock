@@ -29,6 +29,7 @@ MAX_NAME_LEN = 120
 REMOVED, SKIPPED, FAILED = 'removed', 'skipped', 'failed'
 
 VpkChooser = Callable[[list[ExtractedVpk]], list[ExtractedVpk]]
+DuplicateCheck = Callable[[InstalledMod], bool]
 
 
 @dataclass(frozen=True)
@@ -39,6 +40,7 @@ class InstallRequest:
     gamebanana_file: int | None = None
     group: str | None = None
     enabled: bool = True
+    into_mod_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -87,6 +89,23 @@ def free_slot_names(used: set[int], count: int) -> list[str]:
 
 def allocate_slots(addons: Path, count: int) -> list[str]:
     return free_slot_names(used_slots(addons), count)
+
+
+def slot_numbers(files) -> set[int]:
+    """pakNN numbers used by a mod's own file names."""
+    numbers: set[int] = set()
+    for item in files:
+        match = SLOT_RE.match(item.slot)
+        if match:
+            numbers.add(int(match.group(1)))
+    return numbers
+
+
+def find_duplicate(hashes: set[str], mods: list[InstalledMod]) -> InstalledMod | None:
+    """An installed mod whose files have exactly these hashes."""
+    if not hashes:
+        return None
+    return next((m for m in mods if {f.sha256 for f in m.files} == hashes), None)
 
 
 def unmanaged_vpks(addons: Path, mods: list[InstalledMod]) -> list[str]:
@@ -194,9 +213,67 @@ def _patch_gameinfo(game: GamePaths) -> None:
         ui.warn('Fix the problem, then run: python deadlock_mm.py patch')
 
 
-def install(request: InstallRequest, game: GamePaths, choose: VpkChooser) -> InstalledMod | None:
-    """Extract, copy into slots (addons/ or the parking folder), record, then patch gameinfo.gi."""
+def _is_wanted(chosen: list[ExtractedVpk], on_duplicate: DuplicateCheck | None) -> bool:
+    if on_duplicate is None:
+        return True
+    try:
+        hashes = {sha256_file(v.path) for v in chosen}
+    except OSError as e:
+        raise InstallError(f'Cannot read extracted files: {e}') from e
+    existing = find_duplicate(hashes, manifest.load_mods())
+    return existing is None or bool(on_duplicate(existing))
+
+
+def _into_target(request: InstallRequest) -> InstalledMod | None:
+    if request.into_mod_id is None:
+        return None
+    target = manifest.find_mod(request.into_mod_id)
+    if target is None:
+        raise InstallError('The mod to add files to is no longer installed.')
+    return target
+
+
+def _placement(request: InstallRequest, game: GamePaths, mod_id: str, count: int) -> tuple[Path, list[str]]:
+    """Target folder and slot names for a new mod."""
+    _ensure_dir(game.addons)
+    slots = allocate_slots(game.addons, count)
+    target_dir = game.addons if request.enabled else manifest.parking_dir(game.addons, mod_id)
+    _ensure_dir(target_dir)
+    return target_dir, slots
+
+
+def _placement_into(target: InstalledMod, count: int) -> tuple[Path, list[str]]:
+    """Target folder and slot names when appending files to an existing mod."""
+    if target.enabled:
+        _ensure_dir(target.addons)
+        return target.addons, allocate_slots(target.addons, count)
+    _ensure_dir(target.parking)
+    return target.parking, free_slot_names(slot_numbers(target.files), count)
+
+
+def _store(request: InstallRequest, game: GamePaths, into: InstalledMod | None,
+           files: tuple[InstalledFile, ...], target_dir: Path, mod_id: str, group: str | None) -> InstalledMod:
+    if into is not None:
+        record, save = replace(into, files=(*into.files, *files)), manifest.replace_mod
+    else:
+        record, save = _record(request, mod_id, game.addons, files, group), manifest.add_mod
+    try:
+        save(record)
+    except (ConfigError, InstallError) as e:
+        _undo_copies(target_dir, files)
+        raise InstallError(f'Could not record the install; copied files were removed: {e}') from e
+    return record
+
+
+def install(request: InstallRequest, game: GamePaths, choose: VpkChooser,
+            on_duplicate: DuplicateCheck | None = None) -> InstalledMod | None:
+    """Extract, copy into slots (addons/ or the parking folder), record, then patch gameinfo.gi.
+
+    With request.into_mod_id the files are appended to that existing mod instead.
+    on_duplicate(existing) is asked when the chosen VPKs exactly match an installed mod.
+    """
     _validate_request(request)
+    into = _into_target(request)
     group = manifest.canonical_group(manifest.load_mods(), request.group)
     mod_id = manifest.new_mod_id()
     with tempfile.TemporaryDirectory(prefix='dlmm-', ignore_cleanup_errors=True) as tmp:
@@ -204,19 +281,14 @@ def install(request: InstallRequest, game: GamePaths, choose: VpkChooser) -> Ins
         if not vpks:
             raise InstallError(f'No .vpk files found inside {request.archive.name}.')
         chosen = _choose(vpks, choose)
-        if not chosen:
+        if not chosen or not _is_wanted(chosen, on_duplicate):
             return None
-        _ensure_dir(game.addons)
-        slots = allocate_slots(game.addons, len(chosen))
-        target_dir = game.addons if request.enabled else manifest.parking_dir(game.addons, mod_id)
-        _ensure_dir(target_dir)
+        if into is not None:
+            target_dir, slots = _placement_into(into, len(chosen))
+        else:
+            target_dir, slots = _placement(request, game, mod_id, len(chosen))
         files = _copy_into_slots(chosen, target_dir, slots, request.name)
-    record = _record(request, mod_id, game.addons, files, group)
-    try:
-        manifest.add_mod(record)
-    except (ConfigError, InstallError) as e:
-        _undo_copies(target_dir, files)
-        raise InstallError(f'Could not record the install; copied files were removed: {e}') from e
+    record = _store(request, game, into, files, target_dir, mod_id, group)
     _patch_gameinfo(game)
     return record
 
