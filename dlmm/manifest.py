@@ -1,4 +1,4 @@
-"""Records which files each installed mod placed in the addons folder."""
+"""Records which files each installed mod placed in the game, plus its enabled state and group."""
 
 import secrets
 from dataclasses import asdict, dataclass
@@ -13,8 +13,10 @@ from .errors import ConfigError, InstallError
 from .fsutil import format_age
 
 MANIFEST_FILENAME = 'installed.json'
-SCHEMA_VERSION = 1
+DISABLED_DIRNAME = 'dlmm_disabled'
+SCHEMA_VERSION = 2
 MAX_MODS = 1_000
+MAX_GROUP_LEN = 60
 
 
 @dataclass(frozen=True)
@@ -23,6 +25,11 @@ class InstalledFile:
     original: str
     sha256: str
     size: int
+
+
+def parking_dir(addons_dir: str | Path, mod_id: str) -> Path:
+    """Where a disabled mod's files live: citadel/dlmm_disabled/<mod_id>."""
+    return Path(addons_dir).parent / DISABLED_DIRNAME / mod_id
 
 
 @dataclass(frozen=True)
@@ -35,15 +42,84 @@ class InstalledMod:
     files: tuple[InstalledFile, ...]
     gamebanana_mod: int | None = None
     gamebanana_file: int | None = None
+    enabled: bool = True
+    group: str | None = None
+
+    @property
+    def addons(self) -> Path:
+        return Path(self.addons_dir)
+
+    @property
+    def parking(self) -> Path:
+        return parking_dir(self.addons_dir, self.mod_id)
 
     @property
     def slots(self) -> str:
         return ', '.join(f.slot for f in self.files)
 
     @property
-    def hint(self) -> str:
-        return f'{self.slots} · installed {format_age(self.installed)}'
+    def mark(self) -> str:
+        return '✔' if self.enabled else '·'
 
+    @property
+    def hint(self) -> str:
+        parts = [self.slots if self.enabled else 'disabled']
+        if self.group:
+            parts.append(self.group)
+        parts.append(f'installed {format_age(self.installed)}')
+        return ' · '.join(parts)
+
+
+def file_location(mod: InstalledMod, item: InstalledFile) -> Path:
+    return (mod.addons if mod.enabled else mod.parking) / item.slot
+
+
+# ----------------------------------------------------------------------
+# Groups
+# ----------------------------------------------------------------------
+
+def normalize_group(name) -> str | None:
+    if name is None:
+        return None
+    if not isinstance(name, str):
+        raise InstallError('Group name must be text.')
+    clean = ' '.join(name.split())[:MAX_GROUP_LEN].strip()
+    return clean or None
+
+
+def group_key(name: str) -> str:
+    return name.casefold()
+
+
+def list_groups(mods: list[InstalledMod]) -> list[str]:
+    seen: dict[str, str] = {}
+    for mod in mods:
+        if mod.group:
+            seen.setdefault(group_key(mod.group), mod.group)
+    return sorted(seen.values(), key=group_key)
+
+
+def canonical_group(mods: list[InstalledMod], name) -> str | None:
+    """Clean the name and reuse the spelling of an existing group that matches it."""
+    clean = normalize_group(name)
+    if clean is None:
+        return None
+    for existing in list_groups(mods):
+        if group_key(existing) == group_key(clean):
+            return existing
+    return clean
+
+
+def group_members(mods: list[InstalledMod], group: str | None) -> list[InstalledMod]:
+    if not group:
+        return []
+    key = group_key(group)
+    return [m for m in mods if m.group and group_key(m.group) == key]
+
+
+# ----------------------------------------------------------------------
+# Persistence
+# ----------------------------------------------------------------------
 
 def new_mod_id() -> str:
     return secrets.token_hex(6)
@@ -68,6 +144,12 @@ def _mod_from(data: dict) -> InstalledMod:
     files = tuple(_file_from(item) for item in data['files'])
     if not files:
         raise ValueError('entry lists no files')
+    enabled = data.get('enabled', True)
+    if not isinstance(enabled, bool):
+        raise ValueError('enabled must be true or false')
+    group = data.get('group')
+    if group is not None and not isinstance(group, str):
+        raise ValueError('group must be text')
     return InstalledMod(
         mod_id=str(data['mod_id']),
         name=str(data['name']),
@@ -77,6 +159,8 @@ def _mod_from(data: dict) -> InstalledMod:
         files=files,
         gamebanana_mod=_optional_int(data.get('gamebanana_mod')),
         gamebanana_file=_optional_int(data.get('gamebanana_file')),
+        enabled=enabled,
+        group=normalize_group(group),
     )
 
 
@@ -115,6 +199,10 @@ def load_mods() -> list[InstalledMod]:
     return mods
 
 
+def find_mod(mod_id: str) -> InstalledMod | None:
+    return next((m for m in load_mods() if m.mod_id == mod_id), None)
+
+
 def add_mod(mod: InstalledMod) -> None:
     if not isinstance(mod, InstalledMod):
         raise InstallError('Invalid mod record.')
@@ -129,4 +217,6 @@ def remove_mod(mod_id: str) -> None:
 
 
 def replace_mod(mod: InstalledMod) -> None:
+    if not isinstance(mod, InstalledMod):
+        raise InstallError('Invalid mod record.')
     _save([mod if m.mod_id == mod.mod_id else m for m in load_mods()])

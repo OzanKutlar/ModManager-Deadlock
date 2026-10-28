@@ -1,4 +1,7 @@
-"""Install mods into citadel/addons as pakNN_dir.vpk files, and uninstall them again."""
+"""Install mods into citadel/addons as pakNN_dir.vpk files (or park them disabled), and uninstall them.
+
+All VPKs chosen from one archive form a single mod record and are always handled together.
+"""
 
 import os
 import re
@@ -34,6 +37,8 @@ class InstallRequest:
     name: str
     gamebanana_mod: int | None = None
     gamebanana_file: int | None = None
+    group: str | None = None
+    enabled: bool = True
 
 
 @dataclass(frozen=True)
@@ -43,7 +48,7 @@ class UninstallResult:
 
 
 # ----------------------------------------------------------------------
-# Addons folder inspection
+# Addons folder inspection & slots
 # ----------------------------------------------------------------------
 
 def _addon_names(addons: Path) -> list[str]:
@@ -71,28 +76,41 @@ def used_slots(addons: Path) -> set[int]:
     return used
 
 
-def allocate_slots(addons: Path, count: int) -> list[str]:
+def free_slot_names(used: set[int], count: int) -> list[str]:
     if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
         raise InstallError('Slot count must be a positive integer.')
-    used = used_slots(addons)
     free = [f'pak{n:02d}_dir.vpk' for n in range(MIN_SLOT, MAX_SLOT + 1) if n not in used]
     if len(free) < count:
         raise InstallError(f'Not enough free pakNN_dir.vpk slots ({len(free)} free, {count} needed).')
     return free[:count]
 
 
+def allocate_slots(addons: Path, count: int) -> list[str]:
+    return free_slot_names(used_slots(addons), count)
+
+
 def unmanaged_vpks(addons: Path, mods: list[InstalledMod]) -> list[str]:
-    """VPK files in `addons` that no manifest record accounts for."""
+    """VPK files in `addons` that no enabled manifest record accounts for."""
     if not addons.is_dir():
         return []
     target = str(addons.resolve()).lower()
     managed = {
         f.slot.lower()
-        for m in mods if str(Path(m.addons_dir).resolve()).lower() == target
+        for m in mods if m.enabled and str(m.addons.resolve()).lower() == target
         for f in m.files
     }
     names = _addon_names(addons)
     return sorted(n for n in names if n.lower().endswith('.vpk') and n.lower() not in managed)
+
+
+def remove_empty_dir(path: Path) -> None:
+    """Best-effort cleanup of an empty parking folder."""
+    try:
+        path.rmdir()
+    except FileNotFoundError:
+        return
+    except OSError as e:
+        ui.dim(f'Left folder {escape(str(path))} in place: {escape(str(e))}')
 
 
 # ----------------------------------------------------------------------
@@ -106,6 +124,8 @@ def _validate_request(request: InstallRequest) -> None:
         raise InstallError(f'Archive not found: {request.archive}')
     if not request.name.strip():
         raise InstallError('Mod name must not be empty.')
+    if not isinstance(request.enabled, bool):
+        raise InstallError('enabled must be true or false.')
 
 
 def _choose(vpks: list[ExtractedVpk], choose: VpkChooser) -> list[ExtractedVpk]:
@@ -118,40 +138,41 @@ def _choose(vpks: list[ExtractedVpk], choose: VpkChooser) -> list[ExtractedVpk]:
     return chosen
 
 
-def _ensure_addons_dir(addons: Path) -> None:
+def _ensure_dir(path: Path) -> None:
     try:
-        addons.mkdir(parents=True, exist_ok=True)
+        path.mkdir(parents=True, exist_ok=True)
     except OSError as e:
-        raise InstallError(f'Cannot create {addons}: {e}') from e
+        raise InstallError(f'Cannot create {path}: {e}') from e
 
 
-def _undo_copies(addons: Path, files) -> None:
+def _undo_copies(target_dir: Path, files) -> None:
     for item in files:
         try:
-            (addons / item.slot).unlink()
+            (target_dir / item.slot).unlink()
         except FileNotFoundError:
             continue
         except OSError as e:
             ui.warn(f'Could not remove partial file {escape(item.slot)}: {escape(str(e))}')
 
 
-def _copy_into_slots(chosen: list[ExtractedVpk], addons: Path, mod_name: str) -> tuple[InstalledFile, ...]:
-    slots = allocate_slots(addons, len(chosen))
+def _copy_into_slots(chosen: list[ExtractedVpk], target_dir: Path, slots: list[str],
+                     mod_name: str) -> tuple[InstalledFile, ...]:
     installed: list[InstalledFile] = []
     try:
         for vpk, slot in zip(chosen, slots):
-            target = addons / slot
+            target = target_dir / slot
             copy_with_backup(vpk.path, target, f'overwritten while installing {mod_name}')
             installed.append(InstalledFile(slot, vpk.relative, sha256_file(target), target.stat().st_size))
     except (BackupError, OSError) as e:
-        _undo_copies(addons, installed)
-        raise InstallError(f'Copying into addons failed: {e}') from e
+        _undo_copies(target_dir, installed)
+        raise InstallError(f'Copying mod files failed: {e}') from e
     return tuple(installed)
 
 
-def _record(request: InstallRequest, addons: Path, files: tuple[InstalledFile, ...]) -> InstalledMod:
+def _record(request: InstallRequest, mod_id: str, addons: Path,
+            files: tuple[InstalledFile, ...], group: str | None) -> InstalledMod:
     return InstalledMod(
-        mod_id=manifest.new_mod_id(),
+        mod_id=mod_id,
         name=request.name.strip()[:MAX_NAME_LEN],
         source=str(request.archive.resolve()),
         addons_dir=str(addons.resolve()),
@@ -159,21 +180,25 @@ def _record(request: InstallRequest, addons: Path, files: tuple[InstalledFile, .
         files=files,
         gamebanana_mod=request.gamebanana_mod,
         gamebanana_file=request.gamebanana_file,
+        enabled=request.enabled,
+        group=group,
     )
 
 
 def _patch_gameinfo(game: GamePaths) -> None:
     try:
         if gameinfo.ensure_patched(game.gameinfo):
-            ui.ok('Added citadel/addons to gameinfo.gi (backup saved).')
+            ui.ok('Patched gameinfo.gi search paths (backup saved).')
     except GameInfoError as e:
         ui.warn(f'Mod files are installed, but gameinfo.gi could not be patched: {escape(str(e))}')
         ui.warn('Fix the problem, then run: python deadlock_mm.py patch')
 
 
 def install(request: InstallRequest, game: GamePaths, choose: VpkChooser) -> InstalledMod | None:
-    """Extract, copy into free slots, record, then make sure gameinfo.gi loads addons."""
+    """Extract, copy into slots (addons/ or the parking folder), record, then patch gameinfo.gi."""
     _validate_request(request)
+    group = manifest.canonical_group(manifest.load_mods(), request.group)
+    mod_id = manifest.new_mod_id()
     with tempfile.TemporaryDirectory(prefix='dlmm-', ignore_cleanup_errors=True) as tmp:
         vpks = extract_vpks(request.archive, Path(tmp))
         if not vpks:
@@ -181,13 +206,16 @@ def install(request: InstallRequest, game: GamePaths, choose: VpkChooser) -> Ins
         chosen = _choose(vpks, choose)
         if not chosen:
             return None
-        _ensure_addons_dir(game.addons)
-        files = _copy_into_slots(chosen, game.addons, request.name)
-    record = _record(request, game.addons, files)
+        _ensure_dir(game.addons)
+        slots = allocate_slots(game.addons, len(chosen))
+        target_dir = game.addons if request.enabled else manifest.parking_dir(game.addons, mod_id)
+        _ensure_dir(target_dir)
+        files = _copy_into_slots(chosen, target_dir, slots, request.name)
+    record = _record(request, mod_id, game.addons, files, group)
     try:
         manifest.add_mod(record)
     except (ConfigError, InstallError) as e:
-        _undo_copies(game.addons, files)
+        _undo_copies(target_dir, files)
         raise InstallError(f'Could not record the install; copied files were removed: {e}') from e
     _patch_gameinfo(game)
     return record
@@ -210,15 +238,14 @@ def _remove_file(path: Path, item: InstalledFile, mod_name: str) -> tuple[str, s
 
 
 def uninstall(mod: InstalledMod) -> UninstallResult:
-    """Delete (with backup) every file the mod installed whose hash still matches."""
+    """Delete (with backup) every file of the mod, enabled or parked, whose hash still matches."""
     if not isinstance(mod, InstalledMod):
         raise InstallError('Invalid mod record.')
-    addons = Path(mod.addons_dir)
     removed: list[str] = []
     skipped: list[str] = []
     failed: list[InstalledFile] = []
     for item in mod.files:
-        status, reason = _remove_file(addons / item.slot, item, mod.name)
+        status, reason = _remove_file(manifest.file_location(mod, item), item, mod.name)
         if status == REMOVED:
             removed.append(item.slot)
             continue
@@ -229,4 +256,6 @@ def uninstall(mod: InstalledMod) -> UninstallResult:
         manifest.replace_mod(replace(mod, files=tuple(failed)))
     else:
         manifest.remove_mod(mod.mod_id)
+    if not mod.enabled:
+        remove_empty_dir(mod.parking)
     return UninstallResult(tuple(removed), tuple(skipped))

@@ -39,3 +39,7 @@ class InstallError(DlmmError):
 
 class ProtocolError(DlmmError):
     pass
+
+
+class VpkError(DlmmError):
+    pass
