@@ -188,6 +188,15 @@ def cmd_list(args) -> int:
     return 0
 
 
+def _report_patch_state(state: str) -> None:
+    if state == gameinfo.PATCHED:
+        ok('gameinfo.gi: loads citadel/addons')
+    elif state == gameinfo.INCOMPLETE:
+        warn('gameinfo.gi: patch incomplete (missing Mod/Write paths, game will crash) - run: patch')
+    else:
+        warn('gameinfo.gi: not patched (run: patch)')
+
+
 def _status_game(args) -> None:
     try:
         game = find_game(args.game_dir)
@@ -196,14 +205,11 @@ def _status_game(args) -> None:
         return
     ok(f'Game folder: {escape(str(game.citadel))}')
     try:
-        patched = gameinfo.is_patched(gameinfo.read_gameinfo(game.gameinfo))
+        state = gameinfo.patch_state(gameinfo.read_gameinfo(game.gameinfo))
     except DlmmError as e:
         fail(f'gameinfo.gi: {escape(str(e))}')
     else:
-        if patched:
-            ok('gameinfo.gi: loads citadel/addons')
-        else:
-            warn('gameinfo.gi: not patched (run: patch)')
+        _report_patch_state(state)
     mods = manifest.load_mods()
     info(f'Managed mods: {len(mods)}')
     unmanaged = installer.unmanaged_vpks(game.addons, mods)
@@ -241,6 +247,21 @@ def cmd_status(args) -> int:
     return 0
 
 
+def _warn_if_stale_gameinfo(entry: backups.BackupEntry) -> None:
+    if entry.stored_file.lower() != 'gameinfo.gi':
+        return
+    try:
+        old_text = gameinfo.read_gameinfo(entry.stored_path)
+        current_text = gameinfo.read_gameinfo(Path(entry.original_path))
+        stale = gameinfo.base_layout(old_text) != gameinfo.base_layout(current_text)
+    except DlmmError as e:
+        warn(f'Could not compare with the current gameinfo.gi: {escape(str(e))}')
+        return
+    if stale:
+        warn('This backup is from an older game version; restoring it may break the game. '
+             'Prefer Steam verify + patch instead.')
+
+
 def cmd_rollback(args) -> int:
     entries = backups.list_backups()
     if not entries:
@@ -258,6 +279,7 @@ def cmd_rollback(args) -> int:
         f'Taken: {escape(format_age(entry.created))}',
         title='Roll back', border_style='yellow',
     ))
+    _warn_if_stale_gameinfo(entry)
     if not confirm('Restore this backup? The current file is backed up first.'):
         warn('Rollback cancelled.')
         return 0
@@ -356,13 +378,16 @@ def _warn_if_unpatched(args) -> None:
         return
     try:
         game = find_game(args.game_dir)
-        patched = gameinfo.is_patched(gameinfo.read_gameinfo(game.gameinfo))
+        state = gameinfo.patch_state(gameinfo.read_gameinfo(game.gameinfo))
     except DlmmError as e:
         warn(escape(str(e)))
         return
-    if patched:
+    if state == gameinfo.PATCHED:
         return
-    warn('gameinfo.gi lost its addons entry (usually a game update) - your mods are inactive.')
+    if state == gameinfo.INCOMPLETE:
+        warn('gameinfo.gi is missing Mod/Write search paths - the game will crash on launch with mods.')
+    else:
+        warn('gameinfo.gi lost its addons entry (usually a game update) - your mods are inactive.')
     if confirm('Re-apply the patch now?', default=True):
         gameinfo.ensure_patched(game.gameinfo)
         ok('gameinfo.gi patched (backup saved).')

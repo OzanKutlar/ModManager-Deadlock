@@ -2,6 +2,7 @@ import pytest
 
 from dlmm.game_paths import GamePaths
 
+# Pre-2026-09-29 layout (Mod/Write paths present).
 SAMPLE_GAMEINFO = (
     '"GameInfo"\n{\n\tFileSystem\n\t{\n\t\tSearchPaths\n\t\t{\n'
     '\t\t\tMod                 citadel\n'
@@ -9,6 +10,14 @@ SAMPLE_GAMEINFO = (
     '\t\t\tGame                citadel\n'
     '\t\t\tWrite               core\n'
     '\t\t\tMod                 core\n'
+    '\t\t\tGame                core\n'
+    '\t\t}\n\t}\n}\n'
+)
+
+# Post-2026-09-29 stock layout (no Mod/Write paths).
+NEW_STOCK_GAMEINFO = (
+    '"GameInfo"\n{\n\tFileSystem\n\t{\n\t\tSearchPaths\n\t\t{\n'
+    '\t\t\tGame                citadel\n'
     '\t\t\tGame                core\n'
     '\t\t}\n\t}\n}\n'
 )
@@ -24,6 +33,11 @@ def isolated_home(tmp_path, monkeypatch):
 @pytest.fixture
 def sample_gameinfo() -> str:
     return SAMPLE_GAMEINFO
+
+
+@pytest.fixture
+def new_stock_gameinfo() -> str:
+    return NEW_STOCK_GAMEINFO
 
 
 @pytest.fixture
