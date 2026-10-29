@@ -4,9 +4,13 @@ from dlmm.errors import LinkError
 from dlmm.gamebanana import ModLink, parse_mod_link, safe_filename
 
 
-def test_parse_valid_link():
-    link = parse_mod_link('deadlock-mod-manager:https://gamebanana.com/mmdl/1861275,Mod,670908')
-    assert link == ModLink(file_id=1861275, item_type='Mod', item_id=670908)
+@pytest.mark.parametrize('raw', [
+    'deadlock-mod-manager:https://gamebanana.com/mmdl/1751564,Mod,693381',
+    'deadlock-mod-manager:https://gamebanana.com/dl/1751564,Mod,693381',
+    'deadlock-mod-manager:https://www.gamebanana.com/dl/1751564,Mod,693381',
+])
+def test_parse_valid_link(raw):
+    assert parse_mod_link(raw) == ModLink(file_id=1751564, item_type='Mod', item_id=693381)
 
 
 def test_parse_quoted_and_percent_encoded():
@@ -20,6 +24,9 @@ def test_parse_quoted_and_percent_encoded():
     'deadlock-mod-manager:https://gamebanana.com/mmdl/abc,Mod,2',
     'deadlock-mod-manager:https://gamebanana.com/mmdl/1,Mod,2&calc.exe',
     'deadlock-mod-manager:https://gamebanana.com.evil.example/mmdl/1,Mod,2',
+    'deadlock-mod-manager:https://gamebanana.com.dl.evil.example/dl/1,Mod,2',
+    'deadlock-mod-manager:https://gamebanana.com/files/1,Mod,2',
+    'deadlock-mod-manager:http://gamebanana.com/dl/1,Mod,2',
     'https://gamebanana.com/mmdl/1,Mod,2',
     '',
 ])

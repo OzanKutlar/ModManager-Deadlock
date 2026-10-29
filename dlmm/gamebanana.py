@@ -31,8 +31,10 @@ MAX_UNIQUE_ATTEMPTS = 1_000
 CHUNK = 1 << 20
 BACKSLASH = chr(92)
 LINK_RE = re.compile(
-    r'^deadlock-mod-manager:(?://)?https://gamebanana\.com/mmdl/(\d{1,12}),([A-Za-z]{1,32}),(\d{1,12})/?$'
+    r'^deadlock-mod-manager:(?://)?https://(?:www\.)?gamebanana\.com/(?:mmdl|dl)/'
+    r'(\d{1,12}),([A-Za-z]{1,32}),(\d{1,12})/?$'
 )
+LINK_FORMAT = 'deadlock-mod-manager:https://gamebanana.com/mmdl/<file>,Mod,<mod> (or /dl/)'
 INVALID_NAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 RESERVED_NAMES = frozenset(
     {'CON', 'PRN', 'AUX', 'NUL', *(f'COM{i}' for i in range(1, 10)), *(f'LPT{i}' for i in range(1, 10))}
@@ -71,7 +73,7 @@ def parse_mod_link(raw: str) -> ModLink:
     clean = urllib.parse.unquote(raw.strip().strip('"').strip("'")).strip()
     match = LINK_RE.match(clean)
     if match is None:
-        raise LinkError(f'Not a valid GameBanana 1-click link: {raw!r}')
+        raise LinkError(f'Not a valid GameBanana 1-click link: {raw!r} (expected {LINK_FORMAT})')
     if match.group(2) != 'Mod':
         raise LinkError(f'Unsupported item type {match.group(2)!r} (only Mod is supported).')
     return ModLink(int(match.group(1)), match.group(2), int(match.group(3)))
