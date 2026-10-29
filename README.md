@@ -45,6 +45,8 @@ Using official, SHA-256 verified `vpkmerge v0.22.1` by Slush97:
 - `violet`: Fixes broken camera attachments caused by the Violet update. Verifies files before saving, and creates pinned backups you can revert with `violet --undo`.
 - `pack`: Combines multi-part downloads into one unified `.vpk` so they take only one slot. Later inputs win collisions. Revert anytime with `pack --undo`.
 
+Every new install (from Downloads, a 1-click link or `install --into`) is checked automatically. If it has stale attachments, dlmm asks whether to fix it now. Skip the check once with `install --no-violet-check`, or switch it off with `violet --autocheck off`.
+
 Disabled mods are not deleted. Their files are moved to `game/citadel/dlmm_disabled/<id>/`, where the game doesn't load them. Every VPK chosen from one archive belongs to one mod and is always switched as a unit.
 
 ## Conflicts

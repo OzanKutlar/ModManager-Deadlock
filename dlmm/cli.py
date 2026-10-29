@@ -44,6 +44,14 @@ SHARE = object()
 SCAN_ALL = object()
 FIX_ALL = object()
 IGNORED_CONFLICTS_SETTING = 'ignored_conflicts'
+VIOLET_AUTOCHECK_SETTING = 'violet_autocheck'
+VIOLET_FIX_NOW, VIOLET_NOT_NOW, VIOLET_NEVER = 'fix', 'later', 'never'
+VIOLET_CHOICES = (
+    ('Fix it now', 'the original is backed up (violet --undo)', VIOLET_FIX_NOW),
+    ('Not now', 'fix it later from Violet Fix mod', VIOLET_NOT_NOW),
+    ('Never check new installs automatically', 'turn back on: violet --autocheck on', VIOLET_NEVER),
+)
+MAX_SHOWN_MODELS = 3
 CONFLICT_KEEP, CONFLICT_COMBINE, CONFLICT_SKIP, CONFLICT_IGNORE, CONFLICT_STOP = (
     'keep', 'combine', 'skip', 'ignore', 'stop',
 )
@@ -506,7 +514,7 @@ def _confirm_duplicate(existing: InstalledMod) -> bool:
     return confirm(f'Already installed as {_mod_label(existing)} - install anyway?', default=False)
 
 
-def _install_into(archive: Path, name: str, game, mods: list[InstalledMod], query: str) -> int:
+def _install_into(archive: Path, name: str, game, mods: list[InstalledMod], query: str, args) -> int:
     target = _select_mod(mods, query, 'Add files to which mod?', 'No mods installed by dlmm.')
     if target is None:
         return 1
@@ -517,8 +525,10 @@ def _install_into(archive: Path, name: str, game, mods: list[InstalledMod], quer
         warn('Install cancelled; nothing changed.')
         return 0
     ok(f'{escape(record.name)} now has {len(record.files)} files')
-    if record.enabled:
-        _check_conflicts(record)
+    _offer_violet_fix(record, game, args)
+    current = manifest.find_mod(record.mod_id)
+    if current is not None and current.enabled:
+        _check_conflicts(current)
     return 0
 
 
@@ -527,7 +537,7 @@ def _install_flow(archive: Path, name: str, args, gamebanana_ids: tuple = (None,
     mods = manifest.load_mods()
     into = getattr(args, 'into', None)
     if into:
-        return _install_into(archive, name, game, mods, into)
+        return _install_into(archive, name, game, mods, into, args)
     request = InstallRequest(
         archive, name, gamebanana_ids[0], gamebanana_ids[1],
         hero=getattr(args, 'hero', None), share=bool(getattr(args, 'share', False)),
@@ -541,10 +551,96 @@ def _install_flow(archive: Path, name: str, args, gamebanana_ids: tuple = (None,
     rivals = toggler.enabled_rivals(record)
     if rivals:
         _settle_new_install(record, rivals)
+    _offer_violet_fix(record, game, args)
     current = manifest.find_mod(record.mod_id)
     if current is not None and current.enabled:
         _check_conflicts(current)
     return 0
+
+
+# ----------------------------------------------------------------------
+# Violet check on install
+# ----------------------------------------------------------------------
+
+def _violet_autocheck_on() -> bool:
+    try:
+        return get_setting(VIOLET_AUTOCHECK_SETTING) is not False
+    except DlmmError as e:
+        warn(f'Could not read the Violet check setting: {escape(str(e))}')
+        return False
+
+
+def _should_autocheck(args, game) -> bool:
+    if sys.platform != 'win32' or getattr(args, 'no_violet_check', False):
+        return False
+    if not (game.citadel / violet.BASE_PAK).is_file():
+        return False
+    return _violet_autocheck_on()
+
+
+def _autocheck_scan(mod: InstalledMod, game):
+    """Scan the new mod; problems become a warning and return None."""
+    if not vpkmerge.tool_path().is_file():
+        dim('Downloading vpkmerge for the Violet check (first use, about 9 MB)...')
+    try:
+        with console.status('Checking for Violet update problems...'):
+            return violet.scan(mod, game)
+    except DlmmError as e:
+        warn(f'Violet check skipped: {escape(str(e))}')
+        return None
+
+
+def _report_autocheck(check) -> bool:
+    """Print the result; True when stale files can be fixed."""
+    if not check.stale_files:
+        if check.status == violet.SPLIT:
+            dim('Violet check: split mod, not supported - skipped.')
+        elif check.status in (violet.CHANGED, violet.ERROR):
+            warn(f'Violet check: {escape(check.summary)}')
+        else:
+            dim('Violet check: no fix needed.')
+        return False
+    warn(f'{escape(check.mod.name)} has stale camera attachments from the Violet update ({escape(check.summary)}).')
+    models = [model for item in check.stale_files for model in item.stale_models]
+    for model in models[:MAX_SHOWN_MODELS]:
+        dim(f'    {escape(model)}')
+    if len(models) > MAX_SHOWN_MODELS:
+        dim(f'    … and {len(models) - MAX_SHOWN_MODELS} more')
+    return True
+
+
+def _ask_violet_choice(mod: InstalledMod) -> str:
+    items = [PickItem(label, hint, key) for label, hint, key in VIOLET_CHOICES]
+    choice = pick(f'Fix {mod.name} now?', items)
+    return choice.value if choice else VIOLET_NOT_NOW
+
+
+def _disable_autocheck() -> None:
+    try:
+        set_setting(VIOLET_AUTOCHECK_SETTING, False)
+    except DlmmError as e:
+        warn(f'Could not save your answer: {escape(str(e))}')
+        return
+    dim('New installs will not be checked. Turn it back on with: python deadlock_mm.py violet --autocheck on')
+
+
+def _offer_violet_fix(record: InstalledMod, game, args) -> None:
+    """Scan a freshly installed mod and offer the Violet fix when it is stale."""
+    if not _should_autocheck(args, game):
+        return
+    current = manifest.find_mod(record.mod_id)
+    if current is None:
+        return
+    check = _autocheck_scan(current, game)
+    if check is None or not _report_autocheck(check):
+        return
+    choice = _ask_violet_choice(current)
+    if choice == VIOLET_FIX_NOW:
+        _violet_fix([current], game)
+    elif choice == VIOLET_NEVER:
+        _disable_autocheck()
+    else:
+        dim('Left as is; fix it later from Violet Fix mod.')
 
 
 def _download_with_progress(remote: RemoteFile, folder: Path) -> Path:
@@ -862,6 +958,11 @@ def _violet_undo(args, mods: list[InstalledMod]) -> int:
 
 
 def cmd_violet(args) -> int:
+    autocheck = getattr(args, 'autocheck', None)
+    if autocheck is not None:
+        set_setting(VIOLET_AUTOCHECK_SETTING, None if autocheck == 'on' else False)
+        ok(f'Violet check on install: {autocheck}')
+        return 0
     game = find_game(args.game_dir)
     mods = manifest.load_mods()
     if not mods:
@@ -951,6 +1052,7 @@ def _status_tools() -> None:
     else:
         warn('7z support: py7zr missing (pip install py7zr)')
     info(f'vpkmerge: {escape(vpkmerge.tool_state())}')
+    info(f"Violet check on install: {'on' if _violet_autocheck_on() else 'off'}")
 
 
 def _status_backups() -> None:
@@ -1179,6 +1281,7 @@ def _menu_args(args) -> argparse.Namespace:
         game_dir=args.game_dir, downloads=args.downloads, archive=None, name=None,
         hero=None, share=False, hero_action=None, mod=None,
         reset_ignored=False, into=None, target=None, all=False, undo=False,
+        no_violet_check=False, autocheck=None,
     )
 
 
@@ -1216,6 +1319,8 @@ def _add_install_parser(sub) -> None:
     install.add_argument('--share', action='store_true',
                          help='Allow staying enabled next to other mods for this character')
     install.add_argument('--into', metavar='MOD', help='Add the files to this existing mod instead')
+    install.add_argument('--no-violet-check', dest='no_violet_check', action='store_true',
+                         help='Skip the automatic Violet attachment check')
 
 
 def _add_hero_parser(sub) -> None:
@@ -1250,6 +1355,8 @@ def build_parser() -> argparse.ArgumentParser:
     violet_parser.add_argument('name', nargs='?', help='Mod name (picker if omitted)')
     violet_parser.add_argument('--all', action='store_true', help='Scan all mods immediately')
     violet_parser.add_argument('--undo', action='store_true', help='Restore original files from before the fix')
+    violet_parser.add_argument('--autocheck', choices=('on', 'off'),
+                               help='Check new installs automatically (default: on)')
     pack_parser = sub.add_parser('pack', help='Combine a multi-part mod into a single VPK')
     pack_parser.add_argument('name', nargs='?', help='Mod name (picker if omitted)')
     pack_parser.add_argument('--undo', action='store_true', help='Unpack back into separate original VPKs')
