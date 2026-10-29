@@ -44,6 +44,8 @@ def mod_paths(mod: InstalledMod) -> tuple[frozenset[str], list[str]]:
     paths: set[str] = set()
     problems: list[str] = []
     for item in mod.files:
+        if item.part_of:
+            continue  # chunk files carry data only; their _dir.vpk lists the paths
         try:
             paths |= {p for p in vpk.list_files(file_location(mod, item)) if not is_ignorable(p)}
         except VpkError as e:

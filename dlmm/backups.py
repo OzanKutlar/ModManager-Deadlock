@@ -7,7 +7,7 @@ import re
 import shutil
 import time
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 
 from rich.markup import escape
@@ -136,6 +136,25 @@ def list_backups() -> list[BackupEntry]:
     return entries
 
 
+def find_backup(backup_id: str) -> BackupEntry | None:
+    """The backup with this id, or None (ids with path characters are rejected)."""
+    if not isinstance(backup_id, str) or backup_id in ('', '.', '..') or UNSAFE_CHARS_RE.search(backup_id):
+        return None
+    folder = backups_root() / backup_id
+    return _load_entry(folder) if folder.is_dir() else None
+
+
+def set_pinned(backup_id: str, pinned: bool) -> None:
+    """Pin a backup (never pruned) or release it again. Unknown ids are ignored."""
+    entry = find_backup(backup_id)
+    if entry is None:
+        return
+    try:
+        write_json(backups_root() / entry.backup_id / META_FILENAME, asdict(replace(entry, pinned=bool(pinned))))
+    except ConfigError as e:
+        raise BackupError(f'Could not update backup {backup_id}: {e}') from e
+
+
 def has_pinned_backup(path: Path) -> bool:
     target = str(Path(path).resolve())
     return any(e.pinned and e.original_path == target for e in list_backups())
@@ -176,9 +195,9 @@ def _temporarily_writable(target: Path):
             set_writable(target, False)
 
 
-def copy_with_backup(source: Path, target: Path, reason: str) -> BackupEntry | None:
+def copy_with_backup(source: Path, target: Path, reason: str, pinned: bool = False) -> BackupEntry | None:
     """Back up `target` if it exists, then overwrite it with `source`."""
-    entry = backup_file(target, reason)
+    entry = backup_file(target, reason, pinned=pinned)
     try:
         with _temporarily_writable(target):
             copy_atomic(source, target)
@@ -198,9 +217,9 @@ def write_text_with_backup(target: Path, text: str, reason: str, pinned: bool = 
     return entry
 
 
-def delete_with_backup(target: Path, reason: str) -> BackupEntry:
+def delete_with_backup(target: Path, reason: str, pinned: bool = False) -> BackupEntry:
     """Back up `target`, then delete it."""
-    entry = backup_file(target, reason)
+    entry = backup_file(target, reason, pinned=pinned)
     if entry is None:
         raise BackupError(f'Nothing to delete at {target}.')
     try:
@@ -229,9 +248,16 @@ def restore_backup(entry: BackupEntry) -> BackupEntry | None:
     """Restore a backup to its original location. The current file is backed up first."""
     if not isinstance(entry, BackupEntry):
         raise BackupError('Invalid backup entry.')
+    return restore_backup_to(entry, Path(entry.original_path), f'before rollback to {entry.backup_id}')
+
+
+def restore_backup_to(entry: BackupEntry, target: Path, reason: str) -> BackupEntry | None:
+    """Copy a verified backup to `target`, backing up whatever is there first."""
+    if not isinstance(entry, BackupEntry):
+        raise BackupError('Invalid backup entry.')
     stored = _verify(entry)
-    target = Path(entry.original_path)
-    safety = backup_file(target, f'before rollback to {entry.backup_id}', prune=False)
+    target = Path(target)
+    safety = backup_file(target, reason, prune=False)
     try:
         with _temporarily_writable(target):
             copy_atomic(stored, target)

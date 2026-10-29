@@ -43,3 +43,7 @@ class ProtocolError(DlmmError):
 
 class VpkError(DlmmError):
     pass
+
+
+class VpkMergeError(DlmmError):
+    pass

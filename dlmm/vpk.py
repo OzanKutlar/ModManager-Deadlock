@@ -46,6 +46,16 @@ class _Cursor:
             raise VpkError('Truncated VPK preload data.')
 
 
+def has_signature(path: Path) -> bool:
+    """True when the file starts with the VPK directory signature (chunk files do not)."""
+    try:
+        with open(path, 'rb') as handle:
+            data = handle.read(4)
+    except OSError:
+        return False
+    return len(data) == 4 and struct.unpack('<I', data)[0] == VPK_SIGNATURE
+
+
 def _read_exact(handle, size: int, what: str) -> bytes:
     data = handle.read(size)
     if len(data) != size:

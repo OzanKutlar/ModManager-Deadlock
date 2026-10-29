@@ -6,7 +6,7 @@ from pathlib import Path
 
 from rich.markup import escape
 
-from . import ui
+from . import heroes, ui
 from .backups import backup_file
 from .config import app_dir, read_json, write_json
 from .errors import ConfigError, InstallError
@@ -14,9 +14,9 @@ from .fsutil import format_age
 
 MANIFEST_FILENAME = 'installed.json'
 DISABLED_DIRNAME = 'dlmm_disabled'
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 MAX_MODS = 1_000
-MAX_GROUP_LEN = 60
+MAX_HERO_LEN = 60
 
 
 @dataclass(frozen=True)
@@ -25,6 +25,9 @@ class InstalledFile:
     original: str
     sha256: str
     size: int
+    part_of: str | None = None        # chunk files: slot of their _dir.vpk
+    healed_from: str | None = None    # Violet fix: hash of the original file
+    heal_backup: str | None = None    # Violet fix: backup id holding the original
 
 
 def parking_dir(addons_dir: str | Path, mod_id: str) -> Path:
@@ -43,7 +46,11 @@ class InstalledMod:
     gamebanana_mod: int | None = None
     gamebanana_file: int | None = None
     enabled: bool = True
-    group: str | None = None
+    hero: str | None = None
+    hero_manual: bool = False
+    exclusive: bool = True
+    packed_from: tuple[InstalledFile, ...] = ()
+    pack_backups: tuple[str, ...] = ()
 
     @property
     def addons(self) -> Path:
@@ -55,7 +62,10 @@ class InstalledMod:
 
     @property
     def slots(self) -> str:
-        return ', '.join(f.slot for f in self.files)
+        names = [f.slot for f in self.files if not f.part_of]
+        chunks = len(self.files) - len(names)
+        extra = f' (+{chunks} chunk files)' if chunks else ''
+        return ', '.join(names) + extra
 
     @property
     def mark(self) -> str:
@@ -64,8 +74,13 @@ class InstalledMod:
     @property
     def hint(self) -> str:
         parts = [self.slots if self.enabled else 'disabled']
-        if self.group:
-            parts.append(self.group)
+        if self.hero:
+            shared = heroes.is_hero(self.hero) and not self.exclusive
+            parts.append(f'{self.hero} (shared)' if shared else self.hero)
+        if any(f.healed_from for f in self.files):
+            parts.append('violet-fixed')
+        if self.packed_from:
+            parts.append('packed')
         parts.append(f'installed {format_age(self.installed)}')
         return ' · '.join(parts)
 
@@ -75,46 +90,55 @@ def file_location(mod: InstalledMod, item: InstalledFile) -> Path:
 
 
 # ----------------------------------------------------------------------
-# Groups
+# Characters
 # ----------------------------------------------------------------------
 
-def normalize_group(name) -> str | None:
+def normalize_hero(name) -> str | None:
     if name is None:
         return None
     if not isinstance(name, str):
-        raise InstallError('Group name must be text.')
-    clean = ' '.join(name.split())[:MAX_GROUP_LEN].strip()
+        raise InstallError('Character name must be text.')
+    clean = ' '.join(name.split())[:MAX_HERO_LEN].strip()
     return clean or None
 
 
-def group_key(name: str) -> str:
+def hero_key(name: str) -> str:
     return name.casefold()
 
 
-def list_groups(mods: list[InstalledMod]) -> list[str]:
+def list_heroes(mods: list[InstalledMod]) -> list[str]:
+    """Real characters that installed mods are for (type labels excluded)."""
     seen: dict[str, str] = {}
     for mod in mods:
-        if mod.group:
-            seen.setdefault(group_key(mod.group), mod.group)
-    return sorted(seen.values(), key=group_key)
+        if heroes.is_hero(mod.hero):
+            seen.setdefault(hero_key(mod.hero), mod.hero)
+    return sorted(seen.values(), key=hero_key)
 
 
-def canonical_group(mods: list[InstalledMod], name) -> str | None:
-    """Clean the name and reuse the spelling of an existing group that matches it."""
-    clean = normalize_group(name)
+def canonical_hero(mods: list[InstalledMod], name) -> str | None:
+    """Known display name for a typed name or codename, else an existing spelling, else the text."""
+    clean = normalize_hero(name)
     if clean is None:
         return None
-    for existing in list_groups(mods):
-        if group_key(existing) == group_key(clean):
+    known = heroes.canonical(clean)
+    if known:
+        return known
+    for existing in list_heroes(mods):
+        if hero_key(existing) == hero_key(clean):
             return existing
     return clean
 
 
-def group_members(mods: list[InstalledMod], group: str | None) -> list[InstalledMod]:
-    if not group:
+def hero_members(mods: list[InstalledMod], hero: str | None) -> list[InstalledMod]:
+    if not heroes.is_hero(hero):
         return []
-    key = group_key(group)
-    return [m for m in mods if m.group and group_key(m.group) == key]
+    key = hero_key(hero)
+    return [m for m in mods if heroes.is_hero(m.hero) and hero_key(m.hero) == key]
+
+
+def is_exclusive(mod: InstalledMod) -> bool:
+    """Whether the one-mod-per-character rule applies to this mod."""
+    return mod.exclusive and heroes.is_hero(mod.hero)
 
 
 # ----------------------------------------------------------------------
@@ -133,10 +157,24 @@ def _optional_int(value) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
+def _optional_str(value) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def _flag(data: dict, key: str, default: bool) -> bool:
+    value = data.get(key, default)
+    if not isinstance(value, bool):
+        raise ValueError(f'{key} must be true or false')
+    return value
+
+
 def _file_from(data: dict) -> InstalledFile:
     return InstalledFile(
         slot=str(data['slot']), original=str(data['original']),
         sha256=str(data['sha256']), size=int(data['size']),
+        part_of=_optional_str(data.get('part_of')),
+        healed_from=_optional_str(data.get('healed_from')),
+        heal_backup=_optional_str(data.get('heal_backup')),
     )
 
 
@@ -144,12 +182,13 @@ def _mod_from(data: dict) -> InstalledMod:
     files = tuple(_file_from(item) for item in data['files'])
     if not files:
         raise ValueError('entry lists no files')
-    enabled = data.get('enabled', True)
-    if not isinstance(enabled, bool):
-        raise ValueError('enabled must be true or false')
-    group = data.get('group')
-    if group is not None and not isinstance(group, str):
-        raise ValueError('group must be text')
+    packed_from = tuple(_file_from(item) for item in data.get('packed_from') or ())
+    pack_backups = tuple(str(b) for b in data.get('pack_backups') or ())
+    if len(pack_backups) != len(packed_from):
+        raise ValueError('pack backups do not match the packed parts')
+    hero = data.get('hero')
+    if hero is not None and not isinstance(hero, str):
+        raise ValueError('hero must be text')
     return InstalledMod(
         mod_id=str(data['mod_id']),
         name=str(data['name']),
@@ -159,8 +198,12 @@ def _mod_from(data: dict) -> InstalledMod:
         files=files,
         gamebanana_mod=_optional_int(data.get('gamebanana_mod')),
         gamebanana_file=_optional_int(data.get('gamebanana_file')),
-        enabled=enabled,
-        group=normalize_group(group),
+        enabled=_flag(data, 'enabled', True),
+        hero=normalize_hero(hero),
+        hero_manual=_flag(data, 'hero_manual', False),
+        exclusive=_flag(data, 'exclusive', True),
+        packed_from=packed_from,
+        pack_backups=pack_backups,
     )
 
 

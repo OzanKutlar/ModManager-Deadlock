@@ -17,8 +17,10 @@ pip install -r requirements.txt
 | `python deadlock_mm.py` | Interactive menu |
 | `install [archive] [--name N] [--group G \| --no-group]` | Install a mod; without a path, opens a picker over Downloads, newest first |
 | `enable [name]` / `disable [name]` / `toggle` | Switch mods on or off without deleting them |
-| `group` / `group list` / `group switch [group]` | Manage groups; only one mod per group is active |
-| `group assign [mod]` / `group set <mod> <group>` / `group clear <mod>` | Put mods in groups or take them out |
+| `hero` / `hero list` / `hero switch [hero]` | Manage characters; only one mod per character is active |
+| `hero set <mod> [hero]` / `hero share <mod>` | Set character manually or allow sharing |
+| `violet [name] [--all] [--undo]` | Check and heal stale camera attachments using vpkmerge |
+| `pack [name] [--undo]` | Pack multi-VPK mods into a single consolidated VPK file |
 | `conflicts [--reset-ignored]` | Find enabled mods that replace the same files, and mods installed twice |
 | `merge [target]` / `install --into <mod>` | Combine mods into one, e.g. a skin and its separately downloaded voicelines |
 | `uninstall [name]` | Remove a mod's files (backups are kept) |
@@ -31,11 +33,17 @@ These options work with every command:
 - `--game-dir <Deadlock folder>` sets the game location. You only need it once, because the path is remembered.
 - `--downloads <folder>` changes which folder is scanned for archives.
 
-## Groups and switching
+## Character Exclusivity
 
-Put mods that replace the same thing in one group, for example two skins for the same hero in a group called "Haze skins". Only one member of a group is enabled at a time. Enabling another member, or picking it in `group switch`, disables the current one.
+dlmm automatically identifies which character a skin is for based on paths in its VPK (e.g. `heroes_wip/bookworm` -> `Paige`, `engineer` -> `McGinnis`).
 
-When you install a mod, dlmm asks whether it belongs to a group. Groups whose name matches a word in the mod name are listed first.
+**Rule: Two mods cannot occupy the same character.** Enabling one automatically parks any active skin for that hero. You can override this rule per-mod using `hero share <mod>` or `--share` on install.
+
+## Violet Fix & Packing
+
+Using official, SHA-256 verified `vpkmerge v0.22.1` by Slush97:
+- `violet`: Fixes broken camera attachments caused by the Violet update. Verifies files before saving, and creates pinned backups you can revert with `violet --undo`.
+- `pack`: Combines multi-part downloads into one unified `.vpk` so they take only one slot. Later inputs win collisions. Revert anytime with `pack --undo`.
 
 Disabled mods are not deleted. Their files are moved to `game/citadel/dlmm_disabled/<id>/`, where the game doesn't load them. Every VPK chosen from one archive belongs to one mod and is always switched as a unit.
 

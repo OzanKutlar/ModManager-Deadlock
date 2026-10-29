@@ -1,6 +1,7 @@
-"""Enable/disable mods by moving their VPKs between addons/ and dlmm_disabled/, and manage groups.
+"""Enable/disable mods by moving their VPKs between addons/ and dlmm_disabled/, and manage characters.
 
-Only one mod per group may be enabled: enabling one disables the other members.
+Only one exclusive mod per character may be enabled: enabling one disables the others.
+A mod can be allowed to share its character (exclusive=False) to override the rule.
 Every move is hash-checked and all-or-nothing per mod (partial moves are rolled back).
 """
 
@@ -9,10 +10,10 @@ from dataclasses import dataclass, replace
 
 from rich.markup import escape
 
-from . import manifest, ui
-from .errors import ConfigError, InstallError
+from . import heroes, manifest, ui, units, vpk
+from .errors import ConfigError, InstallError, VpkError
 from .fileops import MovePlan, move_all, undo_moves
-from .installer import SLOT_RE, free_slot_names, remove_empty_dir, used_slots
+from .installer import relocate, remove_empty_dir, used_slots
 from .manifest import InstalledMod
 
 MIN_WORD_LEN = 3
@@ -63,43 +64,28 @@ def _disable_files(current: InstalledMod) -> InstalledMod:
     return _commit(replace(current, enabled=False), plan)
 
 
-def _target_slots(mod: InstalledMod) -> list[str]:
-    """Previous slot names where still free, otherwise the lowest free slots."""
-    used = used_slots(mod.addons)
-    chosen: list[str | None] = []
-    for item in mod.files:
-        match = SLOT_RE.match(item.slot)
-        number = int(match.group(1)) if match else None
-        if number is not None and number not in used:
-            used.add(number)
-            chosen.append(item.slot)
-        else:
-            chosen.append(None)
-    missing = chosen.count(None)
-    fresh = iter(free_slot_names(used, missing) if missing else [])
-    return [slot or next(fresh) for slot in chosen]
-
-
 def _enable_files(current: InstalledMod) -> InstalledMod:
-    slots = _target_slots(current)
+    files = relocate(current.files, used_slots(current.addons))
     try:
         current.addons.mkdir(parents=True, exist_ok=True)
     except OSError as e:
         raise InstallError(f'Cannot create {current.addons}: {e}') from e
-    plan = [(current.parking / f.slot, current.addons / slot, f.sha256) for f, slot in zip(current.files, slots)]
+    plan = [
+        (current.parking / old.slot, current.addons / new.slot, old.sha256)
+        for old, new in zip(current.files, files)
+    ]
     move_all(plan)
-    files = tuple(replace(f, slot=slot) for f, slot in zip(current.files, slots))
     updated = _commit(replace(current, enabled=True, files=files), plan)
     remove_empty_dir(current.parking)
     return updated
 
 
 def enabled_rivals(mod: InstalledMod) -> list[InstalledMod]:
-    """Other enabled members of the mod's group."""
-    if not mod.group:
+    """Other enabled, exclusive mods for the same character (empty when this mod may share)."""
+    if not manifest.is_exclusive(mod):
         return []
-    members = manifest.group_members(manifest.load_mods(), mod.group)
-    return [m for m in members if m.enabled and m.mod_id != mod.mod_id]
+    members = manifest.hero_members(manifest.load_mods(), mod.hero)
+    return [m for m in members if m.enabled and m.exclusive and m.mod_id != mod.mod_id]
 
 
 def _restore(mods) -> None:
@@ -153,22 +139,62 @@ def move_to_state(mod: InstalledMod, enabled: bool) -> InstalledMod:
     return _enable_files(current) if enabled else _disable_files(current)
 
 
-def disable_group(group: str) -> list[InstalledMod]:
-    members = manifest.group_members(manifest.load_mods(), group)
+def disable_hero(hero: str) -> list[InstalledMod]:
+    members = manifest.hero_members(manifest.load_mods(), hero)
     return [disable(m) for m in members if m.enabled]
 
 
 # ----------------------------------------------------------------------
-# Groups
+# Characters
 # ----------------------------------------------------------------------
 
-def set_group(mod: InstalledMod, name: str | None) -> InstalledMod:
-    """Assign (or clear with None) a group. Exclusivity is resolved by the caller."""
+def set_hero(mod: InstalledMod, hero: str | None, manual: bool = True) -> InstalledMod:
+    """Set (or clear with None) the character. Exclusivity is resolved by the caller."""
     current = _fresh(mod)
-    group = manifest.canonical_group(manifest.load_mods(), name)
-    updated = replace(current, group=group)
+    updated = replace(current, hero=manifest.canonical_hero(manifest.load_mods(), hero), hero_manual=manual)
     manifest.replace_mod(updated)
     return updated
+
+
+def set_exclusive(mod: InstalledMod, exclusive: bool) -> InstalledMod:
+    """exclusive=False lets the mod stay enabled next to other mods for its character."""
+    current = _fresh(mod)
+    updated = replace(current, exclusive=bool(exclusive))
+    manifest.replace_mod(updated)
+    return updated
+
+
+def detect_hero(mod: InstalledMod) -> str | None:
+    """Character (or mod type label) from the paths in the mod's VPKs; None if none are readable."""
+    paths: list[str] = []
+    for item in units.mains(mod.files):
+        try:
+            paths.extend(vpk.list_files(manifest.file_location(mod, item)))
+        except VpkError:
+            continue  # unreadable tree: detection is best effort
+    return heroes.describe(paths) if paths else None
+
+
+def refresh_hero(mod: InstalledMod) -> InstalledMod:
+    """Re-detect the character and switch the mod back to automatic detection."""
+    current = _fresh(mod)
+    updated = replace(current, hero=detect_hero(current), hero_manual=False)
+    manifest.replace_mod(updated)
+    return updated
+
+
+def backfill_heroes() -> int:
+    """Detect the character of mods that have none yet (e.g. installed before detection existed)."""
+    mods = manifest.load_mods()
+    changed: dict[str, InstalledMod] = {}
+    for mod in mods:
+        if mod.hero is None and not mod.hero_manual:
+            detected = detect_hero(mod)
+            if detected:
+                changed[mod.mod_id] = replace(mod, hero=detected)
+    if changed:
+        manifest.save_mods([changed.get(m.mod_id, m) for m in mods])
+    return len(changed)
 
 
 def _words(text: str) -> set[str]:
@@ -176,23 +202,7 @@ def _words(text: str) -> set[str]:
     return {w for w in found if len(w) >= MIN_WORD_LEN and w not in STOP_WORDS}
 
 
-def _match_score(group: str, words: set[str], flat: str) -> int:
-    score = 0
-    for word in _words(group):
-        if word in words or (len(word) >= MIN_SUBSTRING_LEN and word in flat):
-            score += 1
-    return score
-
-
 def name_words(text: str) -> set[str]:
     """Meaningful lower-case words of a name (camelCase and separators split, stop words removed)."""
     return _words(text)
 
-
-def suggest_groups(mods: list[InstalledMod], *names: str) -> list[tuple[str, bool]]:
-    """All existing groups as (group, matched), best matches for the given names first."""
-    text = ' '.join(n for n in names if isinstance(n, str))
-    words, flat = _words(text), text.casefold()
-    scored = [(_match_score(g, words, flat), g) for g in manifest.list_groups(mods)]
-    scored.sort(key=lambda item: (-item[0], manifest.group_key(item[1])))
-    return [(group, score > 0) for score, group in scored]

@@ -9,7 +9,10 @@ from rich.markup import escape
 from rich.panel import Panel
 from rich.progress import BarColumn, DownloadColumn, Progress, TimeRemainingColumn, TransferSpeedColumn
 
-from . import __version__, archives, backups, conflicts, gameinfo, installer, manifest, merger, protocol, toggler
+from . import (
+    __version__, archives, backups, conflicts, gameinfo, heroes, installer, manifest, merger,
+    packer, protocol, toggler, units, violet, vpkmerge,
+)
 from .archives import ExtractedVpk
 from .config import get_setting, set_setting
 from .errors import DlmmError
@@ -30,14 +33,23 @@ PROTOCOL_PROMPT = (
 )
 DOWNLOADS_GUID = '{374DE290-123F-4565-9164-39C4925E467B}'
 SHELL_FOLDERS_KEY = r'Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders'
-NEW_GROUP = object()
-NO_GROUP = object()
 DISABLE_ALL = object()
 DONE = object()
+AUTO_HERO = object()
+NEW_HERO = object()
+NO_HERO = object()
+KEEP_NEW = object()
+KEEP_OLD = object()
+SHARE = object()
+SCAN_ALL = object()
+FIX_ALL = object()
 IGNORED_CONFLICTS_SETTING = 'ignored_conflicts'
-CONFLICT_GROUP, CONFLICT_SKIP, CONFLICT_IGNORE, CONFLICT_STOP = 'group', 'skip', 'ignore', 'stop'
+CONFLICT_KEEP, CONFLICT_COMBINE, CONFLICT_SKIP, CONFLICT_IGNORE, CONFLICT_STOP = (
+    'keep', 'combine', 'skip', 'ignore', 'stop',
+)
 CONFLICT_ACTIONS = (
-    ('Put them in the same group', CONFLICT_GROUP),
+    ('Keep one, disable the other', CONFLICT_KEEP),
+    ('Combine them into one mod', CONFLICT_COMBINE),
     ('Not now', CONFLICT_SKIP),
     ('Ignore this pair from now on', CONFLICT_IGNORE),
     ('Skip the remaining conflicts', CONFLICT_STOP),
@@ -45,8 +57,10 @@ CONFLICT_ACTIONS = (
 MENU_ACTIONS = (
     ('Install mod from Downloads', 'install'),
     ('Enable / disable mods', 'toggle'),
-    ('Mod groups', 'group'),
+    ('Characters', 'hero'),
     ('Combine mods', 'merge'),
+    ('Pack a mod into one VPK', 'pack'),
+    ('Violet Fix mod', 'violet'),
     ('Uninstall mod', 'uninstall'),
     ('List installed mods', 'list'),
     ('Check for conflicts', 'conflicts'),
@@ -54,13 +68,14 @@ MENU_ACTIONS = (
     ('Re-apply gameinfo.gi patch', 'patch'),
     ('Status', 'status'),
 )
-GROUP_ACTIONS = (
-    ('Assign a mod to a group', 'assign'),
-    ('Switch the active mod in a group', 'switch'),
-    ('List groups', 'list'),
+HERO_ACTIONS = (
+    ('Switch the active mod for a character', 'switch'),
+    ('List mods by character', 'list'),
+    ('Set the character of a mod', 'set'),
+    ('Allow or stop a mod sharing its character', 'share'),
 )
 SIMPLE_COMMANDS = (
-    ('list', 'List installed mods by group'),
+    ('list', 'List installed mods by character'),
     ('status', 'Show game path, patch state, tools, conflicts and backups'),
     ('toggle', 'Enable/disable mods from a picker'),
     ('rollback', 'Restore a backed-up file'),
@@ -163,131 +178,130 @@ def _select_mod(mods: list[InstalledMod], query: str | None, title: str, empty: 
 def _report_toggle(result: toggler.ToggleResult) -> None:
     ok(f'Enabled [bold]{escape(result.mod.name)}[/bold] ({escape(result.mod.slots)})')
     for other in result.disabled_others:
-        info(f'Disabled {escape(other.name)} (same group)')
+        info(f'Disabled {escape(other.name)} (same character)')
 
 
 def _print_mods(mods: list[InstalledMod]) -> None:
     for mod in sorted(mods, key=lambda m: m.name.casefold()):
         colour = 'green' if mod.enabled else 'dim'
-        where = escape(mod.slots if mod.enabled else 'disabled')
-        age = escape(format_age(mod.installed))
-        console.print(f'  [{colour}]{mod.mark}[/{colour}] {escape(mod.name)}  [dim]{where} · {age}[/dim]')
+        console.print(f'  [{colour}]{mod.mark}[/{colour}] {escape(mod.name)}  [dim]{escape(mod.hint)}[/dim]')
 
 
-def _print_grouped(mods: list[InstalledMod]) -> None:
-    for group in manifest.list_groups(mods):
-        rule(escape(group))
-        _print_mods(manifest.group_members(mods, group))
-    ungrouped = [m for m in mods if not m.group]
-    if ungrouped:
-        rule('Ungrouped')
-        _print_mods(ungrouped)
+def _print_by_hero(mods: list[InstalledMod]) -> None:
+    for hero in manifest.list_heroes(mods):
+        rule(escape(hero))
+        _print_mods(manifest.hero_members(mods, hero))
+    others = [m for m in mods if not heroes.is_hero(m.hero)]
+    if others:
+        rule('Other mods')
+        _print_mods(others)
 
 
 # ----------------------------------------------------------------------
-# Groups
+# Characters (one enabled mod per character, unless a mod may share)
 # ----------------------------------------------------------------------
 
-def _group_hint(group: str, matched: bool, current: str | None) -> str:
-    if current and manifest.group_key(group) == manifest.group_key(current):
-        return 'current'
-    return 'name match' if matched else ''
-
-
-def _pick_group(mods: list[InstalledMod], title: str, names: tuple,
-                current: str | None = None) -> tuple[bool, str | None]:
-    """Returns (chosen, group); chosen is False when the picker was cancelled."""
-    suggestions = toggler.suggest_groups(mods, *names)
-    items = [PickItem(g, _group_hint(g, matched, current), g) for g, matched in suggestions]
-    items.append(PickItem('New group…', 'type a name, e.g. Haze skins', NEW_GROUP))
-    items.append(PickItem('No group', '', NO_GROUP))
-    has_match = bool(suggestions) and suggestions[0][1]
-    choice = pick(title, items, default_index=0 if has_match else len(items) - 1)
-    if choice is None:
-        return False, None
-    if choice.value is NO_GROUP:
-        return True, None
-    if choice.value is NEW_GROUP:
-        typed = _ask_text('New group name:')
-        if typed is None:
-            return False, None
-        return True, manifest.canonical_group(mods, typed)
-    return True, choice.value
-
-
-def _resolve_group(group: str | None) -> None:
-    """If several members of a group are enabled, ask which one stays."""
-    if not group:
+def _backfill_heroes() -> None:
+    try:
+        count = toggler.backfill_heroes()
+    except DlmmError as e:
+        warn(f'Could not detect characters: {escape(str(e))}')
         return
-    enabled = [m for m in manifest.group_members(manifest.load_mods(), group) if m.enabled]
+    if count:
+        dim(f'Detected the character of {count} mod(s).')
+
+
+def _rival_names(rivals: list[InstalledMod]) -> str:
+    return ', '.join(m.name for m in rivals)
+
+
+def _settle_new_install(record: InstalledMod, rivals: list[InstalledMod]) -> None:
+    """A new mod shares its character with enabled mods: decide which one stays."""
+    names = _rival_names(rivals)
+    items = [
+        PickItem(f'Use {record.name}, disable {names}', 'recommended', KEEP_NEW),
+        PickItem('Keep both enabled', f'{record.name} may share {record.hero} from now on', SHARE),
+        PickItem(f'Keep {names}, disable {record.name}', 'the new mod stays installed', KEEP_OLD),
+    ]
+    choice = pick(f'{record.hero} already has {names} enabled', items)
+    value = choice.value if choice else KEEP_NEW
+    if value is SHARE:
+        toggler.set_exclusive(record, False)
+        ok(f'{escape(record.name)} may share {escape(record.hero)} with other mods.')
+    elif value is KEEP_OLD:
+        toggler.disable(record)
+        ok(f'Disabled {escape(record.name)}; it stays installed.')
+    else:
+        for other in toggler.enable(record).disabled_others:
+            info(f'Disabled {escape(other.name)} (same character)')
+
+
+def _enable_with_rules(mod: InstalledMod) -> None:
+    """Enable a mod; if its character is taken, ask whether to switch or let both stay enabled."""
+    rivals = toggler.enabled_rivals(mod)
+    if rivals:
+        names = _rival_names(rivals)
+        items = [
+            PickItem(f'Enable {mod.name}, disable {names}', 'recommended', KEEP_NEW),
+            PickItem('Enable both', f'{mod.name} may share {mod.hero} from now on', SHARE),
+            PickItem('Cancel', '', None),
+        ]
+        choice = pick(f'{mod.hero} already has {names} enabled', items)
+        if choice is None or choice.value is None:
+            warn(f'{escape(mod.name)} was not enabled.')
+            return
+        if choice.value is SHARE:
+            mod = toggler.set_exclusive(mod, False)
+    result = toggler.enable(mod)
+    _report_toggle(result)
+    _check_conflicts(result.mod)
+
+
+def _resolve_hero(hero: str | None) -> None:
+    """If several exclusive mods of one character are enabled, ask which one stays."""
+    if not heroes.is_hero(hero):
+        return
+    members = manifest.hero_members(manifest.load_mods(), hero)
+    enabled = [m for m in members if m.enabled and m.exclusive]
     if len(enabled) < 2:
         return
-    warn(f'{len(enabled)} mods in {escape(group)} are enabled, but only one can be active.')
-    choice = pick(f'Which mod should stay enabled in {group}?', _mod_items(enabled))
+    warn(f'{len(enabled)} mods for {escape(hero)} are enabled, but only one can be active.')
+    choice = pick(f'Which {hero} mod should stay enabled?', _mod_items(enabled))
     if choice is None:
-        warn('Left as is; run group switch later.')
+        warn('Left as is; run: hero switch')
         return
     _report_toggle(toggler.enable(choice.value))
 
 
-def _apply_group(target: InstalledMod, group: str | None) -> int:
-    updated = toggler.set_group(target, group)
-    if updated.group:
-        ok(f'{escape(updated.name)} is now in {escape(updated.group)}.')
-        _resolve_group(updated.group)
-    else:
-        ok(f'{escape(updated.name)} is no longer in a group.')
-    return 0
-
-
-def _group_assign(args) -> int:
-    mods = manifest.load_mods()
-    target = _select_mod(mods, getattr(args, 'mod', None), 'Select mod to group', 'No mods installed by dlmm.')
-    if target is None:
-        return 0
-    names = (target.name, Path(target.source).name)
-    chosen, group = _pick_group(mods, f'Group for {target.name}', names, current=target.group)
-    return _apply_group(target, group) if chosen else 0
-
-
-def _group_set(args) -> int:
-    target = _select_mod(manifest.load_mods(), args.mod, 'Select mod to group', 'No mods installed by dlmm.')
-    return _apply_group(target, args.group) if target else 1
-
-
-def _group_clear(args) -> int:
-    target = _select_mod(manifest.load_mods(), args.mod, 'Select mod to ungroup', 'No mods installed by dlmm.')
-    return _apply_group(target, None) if target else 1
-
-
-def _choose_group_name(mods: list[InstalledMod], query: str | None) -> str | None:
-    groups = manifest.list_groups(mods)
+def _choose_hero_name(mods: list[InstalledMod], query: str | None) -> str | None:
+    names = manifest.list_heroes(mods)
     if query:
-        match = next((g for g in groups if manifest.group_key(g) == manifest.group_key(query.strip())), None)
+        wanted = manifest.canonical_hero(mods, query)
+        match = next((h for h in names if wanted and manifest.hero_key(h) == manifest.hero_key(wanted)), None)
         if match is None:
-            fail(f'No group named {escape(query)}.')
+            fail(f'No installed mods for {escape(query)}.')
         return match
-    items = [PickItem(g, f'{len(manifest.group_members(mods, g))} mods', g) for g in groups]
-    choice = pick('Select group', items)
+    items = [PickItem(h, f'{len(manifest.hero_members(mods, h))} mods', h) for h in names]
+    choice = pick('Select character', items)
     return choice.value if choice else None
 
 
-def _group_switch(args) -> int:
+def _hero_switch(args) -> int:
     mods = manifest.load_mods()
-    if not manifest.list_groups(mods):
-        info('No groups yet. Assign mods to a group first (group assign).')
+    if not manifest.list_heroes(mods):
+        info('No character mods installed yet.')
         return 0
-    group = _choose_group_name(mods, getattr(args, 'group', None))
-    if group is None:
+    hero = _choose_hero_name(mods, getattr(args, 'hero', None))
+    if hero is None:
         return 0
-    members = sorted(manifest.group_members(mods, group), key=lambda m: m.name.casefold())
+    members = sorted(manifest.hero_members(mods, hero), key=lambda m: m.name.casefold())
     items = _mod_items(members) + [PickItem('None (disable all)', '', DISABLE_ALL)]
     active = next((i for i, m in enumerate(members) if m.enabled), len(members))
-    choice = pick(f'Active mod in {group}', items, default_index=active)
+    choice = pick(f'Active mod for {hero}', items, default_index=active)
     if choice is None:
         return 0
     if choice.value is DISABLE_ALL:
-        for mod in toggler.disable_group(group):
+        for mod in toggler.disable_hero(hero):
             ok(f'Disabled {escape(mod.name)}')
         return 0
     result = toggler.enable(choice.value)
@@ -296,21 +310,80 @@ def _group_switch(args) -> int:
     return 0
 
 
-def _group_list(args) -> int:
+def _hero_list(args) -> int:
     mods = manifest.load_mods()
     if not mods:
         info('No mods installed by dlmm.')
         return 0
-    _print_grouped(mods)
+    _print_by_hero(mods)
     return 0
 
 
-GROUP_HANDLERS = {
-    'assign': _group_assign,
-    'set': _group_set,
-    'clear': _group_clear,
-    'switch': _group_switch,
-    'list': _group_list,
+def _pick_hero_value(mods: list[InstalledMod], mod: InstalledMod) -> tuple[bool, object]:
+    """Returns (chosen, value): a typed or listed name, AUTO_HERO, or None for no character."""
+    items = [PickItem('Detect automatically', 'from the files inside the mod', AUTO_HERO)]
+    for hero in manifest.list_heroes(mods):
+        current = bool(mod.hero) and manifest.hero_key(hero) == manifest.hero_key(mod.hero)
+        items.append(PickItem(hero, 'current' if current else '', hero))
+    items.append(PickItem('Other…', 'type a character name', NEW_HERO))
+    items.append(PickItem('No character', 'never exclusive', NO_HERO))
+    choice = pick(f'Character for {mod.name}', items)
+    if choice is None:
+        return False, None
+    if choice.value is NEW_HERO:
+        typed = _ask_text('Character name:')
+        return typed is not None, typed
+    if choice.value is NO_HERO:
+        return True, None
+    return True, choice.value
+
+
+def _apply_hero(mod: InstalledMod, value) -> int:
+    word = value.strip().lower() if isinstance(value, str) else ''
+    if value is AUTO_HERO or word == 'auto':
+        updated = toggler.refresh_hero(mod)
+    elif value is None or word == 'none':
+        updated = toggler.set_hero(mod, None)
+    else:
+        updated = toggler.set_hero(mod, value)
+    label = updated.hero or 'no character'
+    ok(f'{escape(updated.name)}: {escape(label)}')
+    _resolve_hero(updated.hero)
+    return 0
+
+
+def _hero_set(args) -> int:
+    mods = manifest.load_mods()
+    target = _select_mod(mods, getattr(args, 'mod', None), 'Select mod', 'No mods installed by dlmm.')
+    if target is None:
+        return 0
+    value = getattr(args, 'hero', None)
+    if value is None:
+        chosen, value = _pick_hero_value(mods, target)
+        if not chosen:
+            return 0
+    return _apply_hero(target, value)
+
+
+def _hero_share(args) -> int:
+    target = _select_mod(manifest.load_mods(), getattr(args, 'mod', None), 'Select mod', 'No mods installed by dlmm.')
+    if target is None:
+        return 0
+    if target.exclusive:
+        toggler.set_exclusive(target, False)
+        ok(f'{escape(target.name)} may now stay enabled next to other mods for its character.')
+        return 0
+    updated = toggler.set_exclusive(target, True)
+    ok(f'{escape(target.name)} is exclusive again.')
+    _resolve_hero(updated.hero)
+    return 0
+
+
+HERO_HANDLERS = {
+    'switch': _hero_switch,
+    'list': _hero_list,
+    'set': _hero_set,
+    'share': _hero_share,
 }
 
 
@@ -356,8 +429,6 @@ def _fresh_pair(conflict: conflicts.Conflict) -> tuple[InstalledMod, InstalledMo
     b = manifest.find_mod(conflict.second.mod_id)
     if a is None or b is None or not (a.enabled and b.enabled):
         return None
-    if a.group and b.group and manifest.group_key(a.group) == manifest.group_key(b.group):
-        return None
     return a, b
 
 
@@ -367,17 +438,25 @@ def _ask_conflict_action(a: InstalledMod, b: InstalledMod) -> str:
     return choice.value if choice else CONFLICT_STOP
 
 
-def _group_pair(a: InstalledMod, b: InstalledMod) -> None:
-    group = a.group or b.group
-    if group is None:
-        chosen, group = _pick_group(manifest.load_mods(), f'Group for {a.name} and {b.name}', (a.name, b.name))
-        if not chosen or group is None:
-            warn('No group chosen; nothing changed.')
-            return
-    for mod in (a, b):
-        toggler.set_group(mod, group)
-    ok(f'Both mods are now in {escape(group)}.')
-    _resolve_group(group)
+def _keep_one(a: InstalledMod, b: InstalledMod) -> None:
+    choice = pick('Which one stays enabled?', _mod_items([a, b]))
+    if choice is None:
+        warn('Nothing changed.')
+        return
+    other = b if choice.value.mod_id == a.mod_id else a
+    toggler.disable(other)
+    ok(f'Disabled {escape(other.name)}')
+
+
+def _combine_pair(a: InstalledMod, b: InstalledMod) -> None:
+    choice = pick('Which mod should be kept (the other is merged into it)?', _mod_items([a, b]))
+    if choice is None:
+        warn('Nothing changed.')
+        return
+    source = b if choice.value.mod_id == a.mod_id else a
+    record = merger.merge(choice.value, [source])
+    ok(f'Combined into [bold]{escape(record.name)}[/bold] ({len(record.files)} files)')
+    _offer_pack(record)
 
 
 def _handle_conflicts(report: conflicts.ConflictReport) -> int:
@@ -393,8 +472,10 @@ def _handle_conflicts(report: conflicts.ConflictReport) -> int:
         action = _ask_conflict_action(*pair)
         if action == CONFLICT_STOP:
             break
-        if action == CONFLICT_GROUP:
-            _group_pair(*pair)
+        if action == CONFLICT_KEEP:
+            _keep_one(*pair)
+        elif action == CONFLICT_COMBINE:
+            _combine_pair(*pair)
         elif action == CONFLICT_IGNORE:
             _ignore_pair(*pair)
     return handled
@@ -411,27 +492,10 @@ def _check_conflicts(only_with: InstalledMod | None = None) -> None:
 # Install
 # ----------------------------------------------------------------------
 
-def _group_for_install(args, mods: list[InstalledMod], name: str, archive_name: str) -> str | None:
-    if getattr(args, 'no_group', False):
-        return None
-    preset = getattr(args, 'group', None)
-    if preset:
-        return manifest.canonical_group(mods, preset)
-    chosen, group = _pick_group(mods, f'Is {name} part of a group?', (name, archive_name))
-    return group if chosen else None
-
-
-def _confirm_takeover(group: str | None, rivals: list[InstalledMod]) -> bool:
-    if not rivals:
-        return True
-    names = ', '.join(m.name for m in rivals)
-    return confirm(f'{group} already has {names} enabled. Enable the new mod and disable it?', default=True)
-
-
 def _report_install(record: InstalledMod) -> None:
     where = record.slots if record.enabled else 'disabled (parked)'
-    group = f' in group {escape(record.group)}' if record.group else ''
-    ok(f'Installed [bold]{escape(record.name)}[/bold] as {escape(where)}{group}')
+    who = f' for {escape(record.hero)}' if record.hero else ''
+    ok(f'Installed [bold]{escape(record.name)}[/bold]{who} as {escape(where)}')
     if len(record.files) > 1:
         dim(f'{len(record.files)} files are managed together as one mod.')
     if record.enabled:
@@ -464,21 +528,22 @@ def _install_flow(archive: Path, name: str, args, gamebanana_ids: tuple = (None,
     into = getattr(args, 'into', None)
     if into:
         return _install_into(archive, name, game, mods, into)
-    group = _group_for_install(args, mods, name, archive.name)
-    rivals = [m for m in manifest.group_members(mods, group) if m.enabled]
-    enabled = _confirm_takeover(group, rivals)
-    request = InstallRequest(archive, name, gamebanana_ids[0], gamebanana_ids[1], group=group, enabled=enabled)
+    request = InstallRequest(
+        archive, name, gamebanana_ids[0], gamebanana_ids[1],
+        hero=getattr(args, 'hero', None), share=bool(getattr(args, 'share', False)),
+    )
     rule(f'Installing {escape(name)}')
     record = installer.install(request, game, choose_vpks, _confirm_duplicate)
     if record is None:
         warn('Install cancelled; nothing changed.')
         return 0
-    if record.enabled and record.group:
-        for other in toggler.enable(record).disabled_others:
-            info(f'Disabled {escape(other.name)} (same group)')
     _report_install(record)
-    if record.enabled:
-        _check_conflicts(record)
+    rivals = toggler.enabled_rivals(record)
+    if rivals:
+        _settle_new_install(record, rivals)
+    current = manifest.find_mod(record.mod_id)
+    if current is not None and current.enabled:
+        _check_conflicts(current)
     return 0
 
 
@@ -543,9 +608,7 @@ def cmd_enable(args) -> int:
     target = _select_mod(candidates, args.name, 'Select mod to enable', 'No disabled mods.')
     if target is None:
         return 0
-    result = toggler.enable(target)
-    _report_toggle(result)
-    _check_conflicts(result.mod)
+    _enable_with_rules(target)
     return 0
 
 
@@ -566,9 +629,7 @@ def _flip(mod: InstalledMod) -> None:
             toggler.disable(mod)
             ok(f'Disabled {escape(mod.name)}')
             return
-        result = toggler.enable(mod)
-        _report_toggle(result)
-        _check_conflicts(result.mod)
+        _enable_with_rules(mod)
     except DlmmError as e:
         fail(escape(str(e)))
 
@@ -588,25 +649,27 @@ def cmd_toggle(args) -> int:
     return 0
 
 
-def _menu_group_args(args) -> argparse.Namespace:
+def _menu_hero_args(args) -> argparse.Namespace:
     sub = argparse.Namespace(**vars(args))
     sub.mod = None
-    sub.group = None
+    sub.hero = None
     return sub
 
 
-def cmd_group(args) -> int:
-    action = getattr(args, 'group_action', None)
+def cmd_hero(args) -> int:
+    _backfill_heroes()
+    action = getattr(args, 'hero_action', None)
     if action is not None:
-        return GROUP_HANDLERS[action](args)
-    choice = pick('Mod groups', [PickItem(label, '', key) for label, key in GROUP_ACTIONS])
+        return HERO_HANDLERS[action](args)
+    choice = pick('Characters', [PickItem(label, '', key) for label, key in HERO_ACTIONS])
     if choice is None:
         return 0
-    return GROUP_HANDLERS[choice.value](_menu_group_args(args))
+    return HERO_HANDLERS[choice.value](_menu_hero_args(args))
 
 
 def cmd_list(args) -> int:
-    return _group_list(args)
+    _backfill_heroes()
+    return _hero_list(args)
 
 
 def _offer_duplicate_cleanup(mods: list[InstalledMod]) -> None:
@@ -675,6 +738,159 @@ def cmd_merge(args) -> int:
     record = merger.merge(target, sources, new_name)
     where = record.slots if record.enabled else 'disabled'
     ok(f'Combined into [bold]{escape(record.name)}[/bold]: {len(record.files)} files ({escape(where)})')
+    _offer_pack(record)
+    return 0
+
+
+# ----------------------------------------------------------------------
+# Pack (vpkmerge)
+# ----------------------------------------------------------------------
+
+def _game_closed_or_confirmed() -> bool:
+    if violet.game_running():
+        return confirm('Deadlock seems to be running. Replacing VPKs now can crash it. Continue anyway?')
+    return True
+
+
+def _pick_pack_order(mod: InstalledMod) -> list[str] | None:
+    """Part slots, lowest priority first; the chosen winner goes last."""
+    mains = units.mains(mod.files)
+    items = [PickItem(f.slot, f.original, f.slot) for f in mains]
+    choice = pick(f'{mod.name}: which part should win where they overlap?', items, default_index=len(items) - 1)
+    if choice is None:
+        return None
+    return [f.slot for f in mains if f.slot != choice.value] + [choice.value]
+
+
+def _pack_flow(mod: InstalledMod) -> None:
+    order = _pick_pack_order(mod)
+    if order is None:
+        warn('Pack cancelled.')
+        return
+    if not _game_closed_or_confirmed():
+        return
+    info('Packing with vpkmerge...')
+    record = packer.pack(mod, order)
+    ok(f'Packed {len(order)} VPKs into {escape(record.slots)} (originals kept: pack --undo).')
+    if record.enabled:
+        _check_conflicts(record)
+
+
+def _offer_pack(record: InstalledMod) -> None:
+    if sys.platform != 'win32' or len(units.mains(record.files)) < 2:
+        return
+    if confirm('Pack its VPKs into one file with vpkmerge? (best when the parts overlap, e.g. two versions of a skin)'):
+        _pack_flow(manifest.find_mod(record.mod_id) or record)
+
+
+def cmd_pack(args) -> int:
+    mods = manifest.load_mods()
+    if getattr(args, 'undo', False):
+        packed = [m for m in mods if m.packed_from]
+        target = _select_mod(packed, args.name, 'Undo the pack of which mod?', 'No packed mods.')
+        if target is None or not _game_closed_or_confirmed():
+            return 0
+        restored = packer.undo_pack(target)
+        ok(f'{escape(restored.name)} is back to {len(units.mains(restored.files))} separate VPKs.')
+        return 0
+    multi = [m for m in mods if len(units.mains(m.files)) >= 2 and not m.packed_from]
+    target = _select_mod(multi, args.name, 'Pack which mod into one VPK?', 'No mods with several VPKs (combine mods first).')
+    if target is not None:
+        _pack_flow(target)
+    return 0
+
+
+# ----------------------------------------------------------------------
+# Violet Fix mod
+# ----------------------------------------------------------------------
+
+def _violet_scan(mods: list[InstalledMod], game) -> dict:
+    checks = {}
+    with console.status('Checking mods with vpkmerge...'):
+        for mod in mods[:violet.MAX_MODS]:
+            checks[mod.mod_id] = violet.scan(mod, game)
+    return checks
+
+
+def _violet_items(mods: list[InstalledMod], checks: dict) -> list[PickItem]:
+    items = [PickItem('Scan all mods', 'checks every mod with vpkmerge', SCAN_ALL)]
+    stale = [c for c in checks.values() if c.stale_files]
+    if stale:
+        items.append(PickItem(f'Fix all stale mods ({len(stale)})', 'originals are backed up', FIX_ALL))
+    for mod in sorted(mods, key=lambda m: m.name.casefold()):
+        check = checks.get(mod.mod_id)
+        items.append(PickItem(f'{mod.mark} {mod.name}', check.summary if check else mod.hint, mod))
+    return items
+
+
+def _violet_fix(targets: list[InstalledMod], game) -> None:
+    if not _game_closed_or_confirmed():
+        return
+    for mod in targets:
+        try:
+            result = violet.fix(mod, game)
+        except DlmmError as e:
+            fail(f'{escape(mod.name)}: {escape(str(e))}')
+            continue
+        for slot in result.fixed:
+            ok(f'Fixed {escape(mod.name)} / {escape(slot)} (original kept: violet --undo)')
+        for note in result.notes:
+            warn(f'{escape(mod.name)}: {escape(note)}')
+        if not result.fixed and not result.notes:
+            info(f'{escape(mod.name)} needs no fix.')
+
+
+def _violet_one(mod: InstalledMod, game) -> None:
+    check = violet.scan(mod, game)
+    info(f'{escape(mod.name)}: {escape(check.summary)}')
+    for file_check in check.files:
+        for model in file_check.stale_models:
+            dim(f'    {escape(model)}')
+    if check.stale_files and confirm(f'Fix {mod.name}? The original is backed up for undo.', default=True):
+        _violet_fix([mod], game)
+
+
+def _violet_undo(args, mods: list[InstalledMod]) -> int:
+    fixed = [m for m in mods if any(f.healed_from for f in m.files)]
+    title = 'Undo the Violet fix of which mod?'
+    target = _select_mod(fixed, getattr(args, 'name', None), title, 'No Violet-fixed mods.')
+    if target is None or not _game_closed_or_confirmed():
+        return 0
+    restored = violet.undo(target)
+    ok(f'Restored the original files of {escape(restored.name)}.')
+    return 0
+
+
+def cmd_violet(args) -> int:
+    game = find_game(args.game_dir)
+    mods = manifest.load_mods()
+    if not mods:
+        info('No mods installed by dlmm.')
+        return 0
+    if getattr(args, 'undo', False):
+        return _violet_undo(args, mods)
+    if getattr(args, 'name', None):
+        target = _match_mod(mods, args.name, 'Select mod')
+        if target is not None:
+            _violet_one(target, game)
+        return 0
+    checks = _violet_scan(mods, game) if getattr(args, 'all', False) else {}
+    for _ in range(MAX_MENU_ROUNDS):
+        choice = pick('Violet Fix mod', _violet_items(mods, checks))
+        if choice is None:
+            return 0
+        if choice.value is SCAN_ALL:
+            checks = _violet_scan(mods, game)
+            continue
+        if choice.value is FIX_ALL:
+            stale = [c.mod for c in checks.values() if c.stale_files]
+            if confirm(f'Fix {len(stale)} mod(s)? Originals are backed up.', default=True):
+                _violet_fix(stale, game)
+            checks = {}
+        else:
+            _violet_one(choice.value, game)
+            checks.pop(choice.value.mod_id, None)
+        mods = manifest.load_mods()
     return 0
 
 
@@ -689,12 +905,12 @@ def _report_patch_state(state: str) -> None:
 
 def _status_mods(mods: list[InstalledMod]) -> None:
     disabled = sum(1 for m in mods if not m.enabled)
-    groups = manifest.list_groups(mods)
-    info(f'Managed mods: {len(mods)} ({disabled} disabled, {len(groups)} groups)')
-    for group in groups:
-        active = [m for m in manifest.group_members(mods, group) if m.enabled]
+    names = manifest.list_heroes(mods)
+    info(f'Managed mods: {len(mods)} ({disabled} disabled, {len(names)} characters)')
+    for hero in names:
+        active = [m for m in manifest.hero_members(mods, hero) if m.enabled and m.exclusive]
         if len(active) > 1:
-            warn(f'Group {escape(group)} has {len(active)} enabled mods (run: group switch).')
+            warn(f'{escape(hero)} has {len(active)} enabled mods (run: hero switch).')
     report = conflicts.find_conflicts(mods, None, _load_ignored())
     if report.conflicts:
         warn(f'{len(report.conflicts)} conflict(s) between enabled mods (run: conflicts).')
@@ -734,6 +950,7 @@ def _status_tools() -> None:
         ok('7z support: py7zr installed')
     else:
         warn('7z support: py7zr missing (pip install py7zr)')
+    info(f'vpkmerge: {escape(vpkmerge.tool_state())}')
 
 
 def _status_backups() -> None:
@@ -773,6 +990,16 @@ def _warn_if_stale_gameinfo(entry: backups.BackupEntry) -> None:
              'Prefer Steam verify + patch instead.')
 
 
+def _warn_if_tracked_backup(entry: backups.BackupEntry) -> None:
+    for mod in manifest.load_mods():
+        if any(f.heal_backup == entry.backup_id for f in mod.files):
+            warn(f'This is the original of a Violet fix ({escape(mod.name)}). Use violet --undo instead.')
+            return
+        if entry.backup_id in mod.pack_backups:
+            warn(f'This is a part of the packed mod {escape(mod.name)}. Use pack --undo instead.')
+            return
+
+
 def cmd_rollback(args) -> int:
     entries = backups.list_backups()
     if not entries:
@@ -791,6 +1018,7 @@ def cmd_rollback(args) -> int:
         title='Roll back', border_style='yellow',
     ))
     _warn_if_stale_gameinfo(entry)
+    _warn_if_tracked_backup(entry)
     if not confirm('Restore this backup? The current file is backed up first.'):
         warn('Rollback cancelled.')
         return 0
@@ -874,7 +1102,9 @@ COMMANDS = {
     'enable': cmd_enable,
     'disable': cmd_disable,
     'toggle': cmd_toggle,
-    'group': cmd_group,
+    'hero': cmd_hero,
+    'violet': cmd_violet,
+    'pack': cmd_pack,
     'list': cmd_list,
     'conflicts': cmd_conflicts,
     'merge': cmd_merge,
@@ -947,8 +1177,8 @@ def _offer_protocol_takeover() -> None:
 def _menu_args(args) -> argparse.Namespace:
     return argparse.Namespace(
         game_dir=args.game_dir, downloads=args.downloads, archive=None, name=None,
-        group=None, no_group=False, group_action=None, mod=None,
-        reset_ignored=False, into=None, target=None,
+        hero=None, share=False, hero_action=None, mod=None,
+        reset_ignored=False, into=None, target=None, all=False, undo=False,
     )
 
 
@@ -962,6 +1192,7 @@ def _run_menu_command(command: str, args) -> None:
 def interactive(args) -> int:
     console.print(Panel(f'Deadlock Lite Mod Manager [dim]v{__version__}[/dim]', border_style='blue'))
     _offer_protocol_takeover()
+    _backfill_heroes()
     _warn_if_unpatched(args)
     items = [PickItem(label, '', command) for label, command in MENU_ACTIONS]
     items.append(PickItem('Quit', '', None))
@@ -981,25 +1212,23 @@ def _add_install_parser(sub) -> None:
     install = sub.add_parser('install', help='Install a mod archive (picker over Downloads if omitted)')
     install.add_argument('archive', nargs='?', help='Path to a .rar/.zip/.7z/.vpk file')
     install.add_argument('--name', help='Display name for the mod (default: archive name)')
-    grouping = install.add_mutually_exclusive_group()
-    grouping.add_argument('--group', help='Put the mod in this group (skips the group prompt)')
-    grouping.add_argument('--no-group', dest='no_group', action='store_true', help='Do not ask about groups')
-    grouping.add_argument('--into', metavar='MOD', help='Add the files to this existing mod instead')
+    install.add_argument('--hero', help='Character the mod is for (default: detected from its files)')
+    install.add_argument('--share', action='store_true',
+                         help='Allow staying enabled next to other mods for this character')
+    install.add_argument('--into', metavar='MOD', help='Add the files to this existing mod instead')
 
 
-def _add_group_parser(sub) -> None:
-    group_parser = sub.add_parser('group', help='Manage mod groups (only one mod per group is enabled)')
-    actions = group_parser.add_subparsers(dest='group_action')
-    actions.add_parser('list', help='Show groups and their members')
-    switch = actions.add_parser('switch', help='Choose the active mod of a group')
-    switch.add_argument('group', nargs='?')
-    assign = actions.add_parser('assign', help='Pick a mod and a group interactively')
-    assign.add_argument('mod', nargs='?')
-    set_parser = actions.add_parser('set', help='Put a mod in a group')
+def _add_hero_parser(sub) -> None:
+    hero_parser = sub.add_parser('hero', help='Character settings and active mod switcher')
+    actions = hero_parser.add_subparsers(dest='hero_action')
+    actions.add_parser('list', help='Show mods by character')
+    switch = actions.add_parser('switch', help='Switch the active mod for a character')
+    switch.add_argument('hero', nargs='?')
+    set_parser = actions.add_parser('set', help='Assign a character to a mod')
     set_parser.add_argument('mod')
-    set_parser.add_argument('group')
-    clear = actions.add_parser('clear', help='Remove a mod from its group')
-    clear.add_argument('mod')
+    set_parser.add_argument('hero', nargs='?', help='Character name, or "auto" / "none"')
+    share = actions.add_parser('share', help='Toggle whether a mod may share its character')
+    share.add_argument('mod')
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1016,7 +1245,14 @@ def build_parser() -> argparse.ArgumentParser:
     for name, text in (('uninstall', 'Uninstall a mod'), ('enable', 'Enable a mod'), ('disable', 'Disable a mod')):
         named = sub.add_parser(name, help=text)
         named.add_argument('name', nargs='?', help='Mod name (picker if omitted)')
-    _add_group_parser(sub)
+    _add_hero_parser(sub)
+    violet_parser = sub.add_parser('violet', help='Fix mods broken by the Violet camera attachment change')
+    violet_parser.add_argument('name', nargs='?', help='Mod name (picker if omitted)')
+    violet_parser.add_argument('--all', action='store_true', help='Scan all mods immediately')
+    violet_parser.add_argument('--undo', action='store_true', help='Restore original files from before the fix')
+    pack_parser = sub.add_parser('pack', help='Combine a multi-part mod into a single VPK')
+    pack_parser.add_argument('name', nargs='?', help='Mod name (picker if omitted)')
+    pack_parser.add_argument('--undo', action='store_true', help='Unpack back into separate original VPKs')
     merge = sub.add_parser('merge', help='Combine mods into one (e.g. a skin and its voicelines)')
     merge.add_argument('target', nargs='?', help='Mod to keep (picker if omitted)')
     conflicts_parser = sub.add_parser('conflicts', help='Find enabled mods that replace the same files')

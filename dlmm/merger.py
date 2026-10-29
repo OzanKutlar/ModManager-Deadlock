@@ -1,24 +1,24 @@
 """Combine several installed mods into one record (e.g. a skin and its separately downloaded voicelines).
 
 Merged-in mods take on the target's enabled state; every move is hash-checked and any failure
-rolls back all steps. The result keeps the target's id and group.
+rolls back all steps. The result keeps the target's id, character and state.
 """
 
 from dataclasses import replace
 
 from rich.markup import escape
 
-from . import manifest, toggler, ui
+from . import manifest, toggler, ui, units
 from .errors import ConfigError, InstallError
 from .fileops import MovePlan, move_all, undo_moves
 from .fsutil import sha256_file
-from .installer import free_slot_names, remove_empty_dir, slot_numbers
+from .installer import free_slot_names, release_pack_backups, remove_empty_dir, slot_numbers
 from .manifest import InstalledFile, InstalledMod, file_location
 
 MAX_SOURCES = 50
 MAX_NAME_LEN = 120
 
-Renames = dict[tuple[str, str], str]
+Renames = dict[str, tuple[InstalledFile, ...]]
 
 
 def merge_candidates(mods: list[InstalledMod], target: InstalledMod) -> list[tuple[InstalledMod, bool]]:
@@ -87,16 +87,19 @@ def _align_states(target: InstalledMod, sources: list[InstalledMod]) -> tuple[li
 def _park_plan(target: InstalledMod, sources: list[InstalledMod]) -> tuple[MovePlan, Renames]:
     """For a disabled target: move parked source files into its parking folder under unused names."""
     if target.enabled:
-        return [], {}
-    count = sum(len(s.files) for s in sources)
+        return [], {s.mod_id: s.files for s in sources}
+    count = sum(len(units.mains(s.files)) for s in sources)
     names = iter(free_slot_names(slot_numbers(target.files), count))
     plan: MovePlan = []
     renames: Renames = {}
     for source in sources:
-        for item in source.files:
-            new_slot = next(names)
-            plan.append((source.parking / item.slot, target.parking / new_slot, item.sha256))
-            renames[(source.mod_id, item.slot)] = new_slot
+        mapping = {item.slot: next(names) for item in units.mains(source.files)}
+        new_files = units.renamed(source.files, mapping)
+        renames[source.mod_id] = new_files
+        plan.extend(
+            (source.parking / old.slot, target.parking / new.slot, old.sha256)
+            for old, new in zip(source.files, new_files)
+        )
     return plan, renames
 
 
@@ -112,10 +115,7 @@ def _move_parked(target: InstalledMod, aligned: list[InstalledMod],
 
 
 def _combined_files(target: InstalledMod, sources: list[InstalledMod], renames: Renames) -> tuple[InstalledFile, ...]:
-    extra = [
-        replace(item, slot=renames.get((source.mod_id, item.slot), item.slot))
-        for source in sources for item in source.files
-    ]
+    extra = [item for source in sources for item in renames[source.mod_id]]
     return (*target.files, *extra)
 
 
@@ -139,10 +139,13 @@ def merge(target: InstalledMod, sources: list[InstalledMod], new_name: str | Non
     fresh_sources = _validate(current, list(sources))
     aligned, changed = _align_states(current, fresh_sources)
     plan, renames = _move_parked(current, aligned, changed)
+    packed = [m for m in (current, *aligned) if m.packed_from]
     record = replace(
         current,
         name=_clean_name(new_name, current.name),
         files=_combined_files(current, aligned, renames),
+        packed_from=(),
+        pack_backups=(),
     )
     try:
         _save(record, {s.mod_id for s in aligned})
@@ -153,4 +156,8 @@ def merge(target: InstalledMod, sources: list[InstalledMod], new_name: str | Non
     if not current.enabled:
         for source in aligned:
             remove_empty_dir(source.parking)
+    for mod in packed:
+        release_pack_backups(mod)
+    if packed:
+        ui.warn('Combining ended the earlier pack; pack --undo is no longer available for it.')
     return record

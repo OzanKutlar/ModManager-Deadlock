@@ -13,10 +13,10 @@ from typing import Callable
 
 from rich.markup import escape
 
-from . import gameinfo, manifest, ui
+from . import gameinfo, heroes, manifest, ui, units, vpk
 from .archives import ExtractedVpk, extract_vpks
-from .backups import copy_with_backup, delete_with_backup
-from .errors import BackupError, ConfigError, GameInfoError, InstallError
+from .backups import copy_with_backup, delete_with_backup, set_pinned
+from .errors import BackupError, ConfigError, GameInfoError, InstallError, VpkError
 from .fsutil import sha256_file
 from .game_paths import GamePaths
 from .manifest import InstalledFile, InstalledMod
@@ -38,7 +38,8 @@ class InstallRequest:
     name: str
     gamebanana_mod: int | None = None
     gamebanana_file: int | None = None
-    group: str | None = None
+    hero: str | None = None
+    share: bool = False
     enabled: bool = True
     into_mod_id: str | None = None
 
@@ -108,6 +109,54 @@ def find_duplicate(hashes: set[str], mods: list[InstalledMod]) -> InstalledMod |
     return next((m for m in mods if {f.sha256 for f in m.files} == hashes), None)
 
 
+def relocate(files, used: set[int]) -> tuple[InstalledFile, ...]:
+    """Keep each _dir file's slot when free, otherwise give it the lowest free one; chunks follow."""
+    taken = set(used)
+    mapping: dict[str, str] = {}
+    pending: list[str] = []
+    for item in units.mains(files):
+        match = SLOT_RE.match(item.slot)
+        number = int(match.group(1)) if match else None
+        if number is not None and number not in taken:
+            taken.add(number)
+            mapping[item.slot] = item.slot
+        else:
+            pending.append(item.slot)
+    if pending:
+        mapping.update(zip(pending, free_slot_names(taken, len(pending))))
+    return units.renamed(files, mapping)
+
+
+def verify_files(mod: InstalledMod) -> None:
+    """Raise unless every file of the mod still has the hash dlmm recorded."""
+    for item in mod.files:
+        path = manifest.file_location(mod, item)
+        try:
+            actual = sha256_file(path)
+        except OSError as e:
+            raise InstallError(f'Cannot read {path}: {e}') from e
+        if actual != item.sha256:
+            raise InstallError(f'{mod.name}: {item.slot} changed since install.')
+
+
+def _unpin(backup_ids) -> None:
+    for backup_id in backup_ids:
+        try:
+            set_pinned(backup_id, False)
+        except BackupError as e:
+            ui.warn(f'Could not release backup {escape(str(backup_id))}: {escape(str(e))}')
+
+
+def release_pack_backups(mod: InstalledMod) -> None:
+    _unpin(mod.pack_backups)
+
+
+def release_backups(mod: InstalledMod) -> None:
+    """Let the backups kept for a mod's undo options be pruned normally again."""
+    heal_ids = [f.heal_backup for f in (*mod.files, *mod.packed_from) if f.heal_backup]
+    _unpin([*mod.pack_backups, *heal_ids])
+
+
 def unmanaged_vpks(addons: Path, mods: list[InstalledMod]) -> list[str]:
     """VPK files in `addons` that no enabled manifest record accounts for."""
     if not addons.is_dir():
@@ -147,14 +196,34 @@ def _validate_request(request: InstallRequest) -> None:
         raise InstallError('enabled must be true or false.')
 
 
-def _choose(vpks: list[ExtractedVpk], choose: VpkChooser) -> list[ExtractedVpk]:
-    if len(vpks) == 1:
-        return list(vpks)
-    chosen = list(choose(vpks))
-    allowed = {v.path for v in vpks}
-    if any(v.path not in allowed for v in chosen):
+def _units_of(vpks: list[ExtractedVpk]) -> list[units.Unit]:
+    grouped, orphans = units.group_units(vpks)
+    for orphan in orphans:
+        ui.warn(f'Ignoring {escape(orphan.relative)}: chunk file without its _dir.vpk.')
+    return grouped
+
+
+def _choose_units(unit_list: list[units.Unit], choose: VpkChooser) -> list[units.Unit]:
+    """The chooser sees one entry per loadable VPK; chunk files always travel with it."""
+    if len(unit_list) == 1:
+        return list(unit_list)
+    by_path = {u.main.path: u for u in unit_list}
+    picked = list(choose([u.main for u in unit_list]))
+    if any(v.path not in by_path for v in picked):
         raise InstallError('Selection contains a file that is not in the archive.')
-    return chosen
+    return [by_path[v.path] for v in picked]
+
+
+def _hero_for(request: InstallRequest, chosen: list[units.Unit]) -> str | None:
+    if request.hero:
+        return manifest.canonical_hero(manifest.load_mods(), request.hero)
+    paths: list[str] = []
+    for unit in chosen:
+        try:
+            paths.extend(vpk.list_files(unit.main.path))
+        except VpkError:
+            continue  # unreadable tree: detection is best effort
+    return heroes.describe(paths) if paths else None
 
 
 def _ensure_dir(path: Path) -> None:
@@ -174,14 +243,19 @@ def _undo_copies(target_dir: Path, files) -> None:
             ui.warn(f'Could not remove partial file {escape(item.slot)}: {escape(str(e))}')
 
 
-def _copy_into_slots(chosen: list[ExtractedVpk], target_dir: Path, slots: list[str],
+def _copy_one(source: ExtractedVpk, target: Path, mod_name: str, part_of: str | None) -> InstalledFile:
+    copy_with_backup(source.path, target, f'overwritten while installing {mod_name}')
+    return InstalledFile(target.name, source.relative, sha256_file(target), target.stat().st_size, part_of=part_of)
+
+
+def _copy_into_slots(chosen: list[units.Unit], target_dir: Path, slots: list[str],
                      mod_name: str) -> tuple[InstalledFile, ...]:
     installed: list[InstalledFile] = []
     try:
-        for vpk, slot in zip(chosen, slots):
-            target = target_dir / slot
-            copy_with_backup(vpk.path, target, f'overwritten while installing {mod_name}')
-            installed.append(InstalledFile(slot, vpk.relative, sha256_file(target), target.stat().st_size))
+        for unit, slot in zip(chosen, slots):
+            installed.append(_copy_one(unit.main, target_dir / slot, mod_name, None))
+            for index, chunk in unit.chunks:
+                installed.append(_copy_one(chunk, target_dir / units.chunk_slot(slot, index), mod_name, slot))
     except (BackupError, OSError) as e:
         _undo_copies(target_dir, installed)
         raise InstallError(f'Copying mod files failed: {e}') from e
@@ -189,7 +263,7 @@ def _copy_into_slots(chosen: list[ExtractedVpk], target_dir: Path, slots: list[s
 
 
 def _record(request: InstallRequest, mod_id: str, addons: Path,
-            files: tuple[InstalledFile, ...], group: str | None) -> InstalledMod:
+            files: tuple[InstalledFile, ...], hero: str | None) -> InstalledMod:
     return InstalledMod(
         mod_id=mod_id,
         name=request.name.strip()[:MAX_NAME_LEN],
@@ -200,7 +274,9 @@ def _record(request: InstallRequest, mod_id: str, addons: Path,
         gamebanana_mod=request.gamebanana_mod,
         gamebanana_file=request.gamebanana_file,
         enabled=request.enabled,
-        group=group,
+        hero=hero,
+        hero_manual=bool(request.hero),
+        exclusive=not request.share,
     )
 
 
@@ -213,11 +289,11 @@ def _patch_gameinfo(game: GamePaths) -> None:
         ui.warn('Fix the problem, then run: python deadlock_mm.py patch')
 
 
-def _is_wanted(chosen: list[ExtractedVpk], on_duplicate: DuplicateCheck | None) -> bool:
+def _is_wanted(chosen: list[units.Unit], on_duplicate: DuplicateCheck | None) -> bool:
     if on_duplicate is None:
         return True
     try:
-        hashes = {sha256_file(v.path) for v in chosen}
+        hashes = {sha256_file(v.path) for unit in chosen for v in unit.files}
     except OSError as e:
         raise InstallError(f'Cannot read extracted files: {e}') from e
     existing = find_duplicate(hashes, manifest.load_mods())
@@ -252,11 +328,11 @@ def _placement_into(target: InstalledMod, count: int) -> tuple[Path, list[str]]:
 
 
 def _store(request: InstallRequest, game: GamePaths, into: InstalledMod | None,
-           files: tuple[InstalledFile, ...], target_dir: Path, mod_id: str, group: str | None) -> InstalledMod:
+           files: tuple[InstalledFile, ...], target_dir: Path, mod_id: str, hero: str | None) -> InstalledMod:
     if into is not None:
         record, save = replace(into, files=(*into.files, *files)), manifest.replace_mod
     else:
-        record, save = _record(request, mod_id, game.addons, files, group), manifest.add_mod
+        record, save = _record(request, mod_id, game.addons, files, hero), manifest.add_mod
     try:
         save(record)
     except (ConfigError, InstallError) as e:
@@ -274,21 +350,21 @@ def install(request: InstallRequest, game: GamePaths, choose: VpkChooser,
     """
     _validate_request(request)
     into = _into_target(request)
-    group = manifest.canonical_group(manifest.load_mods(), request.group)
     mod_id = manifest.new_mod_id()
     with tempfile.TemporaryDirectory(prefix='dlmm-', ignore_cleanup_errors=True) as tmp:
-        vpks = extract_vpks(request.archive, Path(tmp))
-        if not vpks:
+        unit_list = _units_of(extract_vpks(request.archive, Path(tmp)))
+        if not unit_list:
             raise InstallError(f'No .vpk files found inside {request.archive.name}.')
-        chosen = _choose(vpks, choose)
+        chosen = _choose_units(unit_list, choose)
         if not chosen or not _is_wanted(chosen, on_duplicate):
             return None
+        hero = into.hero if into is not None else _hero_for(request, chosen)
         if into is not None:
             target_dir, slots = _placement_into(into, len(chosen))
         else:
             target_dir, slots = _placement(request, game, mod_id, len(chosen))
         files = _copy_into_slots(chosen, target_dir, slots, request.name)
-    record = _store(request, game, into, files, target_dir, mod_id, group)
+    record = _store(request, game, into, files, target_dir, mod_id, hero)
     _patch_gameinfo(game)
     return record
 
@@ -328,6 +404,7 @@ def uninstall(mod: InstalledMod) -> UninstallResult:
         manifest.replace_mod(replace(mod, files=tuple(failed)))
     else:
         manifest.remove_mod(mod.mod_id)
+        release_backups(mod)
     if not mod.enabled:
         remove_empty_dir(mod.parking)
     return UninstallResult(tuple(removed), tuple(skipped))
