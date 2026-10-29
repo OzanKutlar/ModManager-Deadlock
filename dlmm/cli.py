@@ -11,7 +11,7 @@ from rich.progress import BarColumn, DownloadColumn, Progress, TimeRemainingColu
 
 from . import (
     __version__, archives, backups, conflicts, gameinfo, heroes, installer, manifest, merger,
-    packer, protocol, toggler, units, violet, vpkmerge,
+    packer, protocol, sorting, toggler, units, violet, vpkmerge,
 )
 from .archives import ExtractedVpk
 from .config import get_setting, set_setting
@@ -83,7 +83,6 @@ HERO_ACTIONS = (
     ('Allow or stop a mod sharing its character', 'share'),
 )
 SIMPLE_COMMANDS = (
-    ('list', 'List installed mods by character'),
     ('status', 'Show game path, patch state, tools, conflicts and backups'),
     ('toggle', 'Enable/disable mods from a picker'),
     ('rollback', 'Restore a backed-up file'),
@@ -147,9 +146,9 @@ def _pick_archive(folder: Path) -> Path | None:
     items = []
     for item in found:
         marker = ' · installed' if str(item.path.resolve()) in installed else ''
-        items.append(PickItem(item.name, item.hint + marker, item.path))
-    choice = pick(f'Select mod archive ({folder})', items)
-    return choice.value if choice else None
+        items.append(PickItem(item.name, item.hint + marker, item))
+    choice = sorting.pick_sorted(f'Select mod archive ({folder})', items, 'archives')
+    return choice.value.path if choice else None
 
 
 def _mod_items(mods: list[InstalledMod]) -> list[PickItem]:
@@ -158,7 +157,7 @@ def _mod_items(mods: list[InstalledMod]) -> list[PickItem]:
 
 def _pick_mod(mods: list[InstalledMod], title: str) -> InstalledMod | None:
     ordered = sorted(mods, key=lambda m: m.name.casefold())
-    choice = pick(title, _mod_items(ordered))
+    choice = sorting.pick_sorted(title, _mod_items(ordered))
     return choice.value if choice else None
 
 
@@ -189,8 +188,8 @@ def _report_toggle(result: toggler.ToggleResult) -> None:
         info(f'Disabled {escape(other.name)} (same character)')
 
 
-def _print_mods(mods: list[InstalledMod]) -> None:
-    for mod in sorted(mods, key=lambda m: m.name.casefold()):
+def _print_mods(mods: list[InstalledMod], order: str = 'name') -> None:
+    for mod in sorting.sort_mods(mods, order):
         colour = 'green' if mod.enabled else 'dim'
         console.print(f'  [{colour}]{mod.mark}[/{colour}] {escape(mod.name)}  [dim]{escape(mod.hint)}[/dim]')
 
@@ -274,7 +273,7 @@ def _resolve_hero(hero: str | None) -> None:
     if len(enabled) < 2:
         return
     warn(f'{len(enabled)} mods for {escape(hero)} are enabled, but only one can be active.')
-    choice = pick(f'Which {hero} mod should stay enabled?', _mod_items(enabled))
+    choice = sorting.pick_sorted(f'Which {hero} mod should stay enabled?', _mod_items(enabled))
     if choice is None:
         warn('Left as is; run: hero switch')
         return
@@ -303,9 +302,9 @@ def _hero_switch(args) -> int:
     if hero is None:
         return 0
     members = sorted(manifest.hero_members(mods, hero), key=lambda m: m.name.casefold())
-    items = _mod_items(members) + [PickItem('None (disable all)', '', DISABLE_ALL)]
+    items = _mod_items(members) + [PickItem('None (disable all)', '', DISABLE_ALL, pinned=True)]
     active = next((i for i, m in enumerate(members) if m.enabled), len(members))
-    choice = pick(f'Active mod for {hero}', items, default_index=active)
+    choice = sorting.pick_sorted(f'Active mod for {hero}', items, default_index=active)
     if choice is None:
         return 0
     if choice.value is DISABLE_ALL:
@@ -447,7 +446,7 @@ def _ask_conflict_action(a: InstalledMod, b: InstalledMod) -> str:
 
 
 def _keep_one(a: InstalledMod, b: InstalledMod) -> None:
-    choice = pick('Which one stays enabled?', _mod_items([a, b]))
+    choice = sorting.pick_sorted('Which one stays enabled?', _mod_items([a, b]))
     if choice is None:
         warn('Nothing changed.')
         return
@@ -457,7 +456,7 @@ def _keep_one(a: InstalledMod, b: InstalledMod) -> None:
 
 
 def _combine_pair(a: InstalledMod, b: InstalledMod) -> None:
-    choice = pick('Which mod should be kept (the other is merged into it)?', _mod_items([a, b]))
+    choice = sorting.pick_sorted('Which mod should be kept (the other is merged into it)?', _mod_items([a, b]))
     if choice is None:
         warn('Nothing changed.')
         return
@@ -737,7 +736,8 @@ def cmd_toggle(args) -> int:
         if not mods:
             info('No mods installed by dlmm.')
             return 0
-        choice = pick('Enable / disable mods (Enter flips, Esc when done)', _mod_items(mods), default_index=index)
+        choice = sorting.pick_sorted('Enable / disable mods (Enter flips, Esc when done)', _mod_items(mods),
+                                     default_index=index)
         if choice is None:
             return 0
         index = mods.index(choice.value)
@@ -765,7 +765,16 @@ def cmd_hero(args) -> int:
 
 def cmd_list(args) -> int:
     _backfill_heroes()
-    return _hero_list(args)
+    order = getattr(args, 'sort', None) or 'character'
+    if order == 'character':
+        return _hero_list(args)
+    mods = manifest.load_mods()
+    if not mods:
+        info('No mods installed by dlmm.')
+        return 0
+    rule('Installed mods, newest first' if order == 'time' else 'Installed mods, A→Z')
+    _print_mods(mods, order)
+    return 0
 
 
 def _offer_duplicate_cleanup(mods: list[InstalledMod]) -> None:
@@ -800,11 +809,12 @@ def _pick_merge_sources(mods: list[InstalledMod], target: InstalledMod) -> list[
         remaining = [(m, hit) for m, hit in merger.merge_candidates(mods, target) if m.mod_id not in taken]
         if not remaining:
             return chosen
-        items = [PickItem(f'Done ({len(chosen)} selected)', '', DONE)]
+        items = [PickItem(f'Done ({len(chosen)} selected)', '', DONE, pinned=True)]
         items.extend(
             PickItem(f'{m.mark} {m.name}', ('similar name · ' if hit else '') + m.hint, m) for m, hit in remaining
         )
-        choice = pick(f'Combine into {target.name}: pick mods, then Done', items, default_index=0 if chosen else 1)
+        choice = sorting.pick_sorted(f'Combine into {target.name}: pick mods, then Done', items, 'merge',
+                                     default_index=0 if chosen else 1)
         if choice is None:
             return []
         if choice.value is DONE:
@@ -909,10 +919,10 @@ def _violet_scan(mods: list[InstalledMod], game) -> dict:
 
 
 def _violet_items(mods: list[InstalledMod], checks: dict) -> list[PickItem]:
-    items = [PickItem('Scan all mods', 'checks every mod with vpkmerge', SCAN_ALL)]
+    items = [PickItem('Scan all mods', 'checks every mod with vpkmerge', SCAN_ALL, pinned=True)]
     stale = [c for c in checks.values() if c.stale_files]
     if stale:
-        items.append(PickItem(f'Fix all stale mods ({len(stale)})', 'originals are backed up', FIX_ALL))
+        items.append(PickItem(f'Fix all stale mods ({len(stale)})', 'originals are backed up', FIX_ALL, pinned=True))
     for mod in sorted(mods, key=lambda m: m.name.casefold()):
         check = checks.get(mod.mod_id)
         items.append(PickItem(f'{mod.mark} {mod.name}', check.summary if check else mod.hint, mod))
@@ -977,7 +987,7 @@ def cmd_violet(args) -> int:
         return 0
     checks = _violet_scan(mods, game) if getattr(args, 'all', False) else {}
     for _ in range(MAX_MENU_ROUNDS):
-        choice = pick('Violet Fix mod', _violet_items(mods, checks))
+        choice = sorting.pick_sorted('Violet Fix mod', _violet_items(mods, checks))
         if choice is None:
             return 0
         if choice.value is SCAN_ALL:
@@ -1367,6 +1377,9 @@ def build_parser() -> argparse.ArgumentParser:
                                   help='Forget pairs marked as ignored')
     handle = sub.add_parser('handle', help='Handle a deadlock-mod-manager: 1-click link')
     handle.add_argument('url')
+    list_parser = sub.add_parser('list', help='List installed mods (by character, newest first or name)')
+    list_parser.add_argument('--sort', choices=('character', 'time', 'name'), default='character',
+                             help='character (default), time (newest download first) or name')
     for name, text in SIMPLE_COMMANDS:
         sub.add_parser(name, help=text)
     return parser

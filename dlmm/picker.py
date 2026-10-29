@@ -1,11 +1,12 @@
 """Interactive pickers: a prompt_toolkit pointer menu with a numbered Rich fallback.
 
 Generalised from book_picker.py so one UI serves archives, mods, backups and menus.
+Lists can offer sort orders: s cycles them, r reverses them, and pinned items never move.
 """
 
 import sys
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 from rich.markup import escape
 
@@ -23,9 +24,11 @@ except ImportError:
     HAS_PROMPT_TOOLKIT = False
 
 MAX_NUMBERED_ATTEMPTS = 5
+MAX_SORT_PRESSES = 50
 VISIBLE_ROWS = 15
 PAGE_JUMP = 10
 FOOTER = '↑/↓ move · PgUp/PgDn jump · Enter select · Esc cancel'
+SORT_KEYS_HINT = 's sort · r reverse'
 MENU_STYLE = {
     'title': 'bold ansicyan',
     'pointer': 'bold ansicyan',
@@ -41,10 +44,87 @@ class PickItem:
     label: str
     hint: str = ''
     value: Any = None
+    pinned: bool = False
+
+
+@dataclass(frozen=True)
+class SortOption:
+    """A named order for a list; key=None keeps the order the items were given in."""
+    label: str
+    key: Callable[[PickItem], Any] | None = None
+
+
+@dataclass(frozen=True)
+class SortChoice:
+    label: str
+    reverse: bool = False
 
 
 class MenuUnavailable(RuntimeError):
     pass
+
+
+def apply_sort(items: list[PickItem], option: SortOption, reverse: bool = False) -> list[PickItem]:
+    """Reorder the unpinned items; pinned items keep their positions."""
+    movable = [item for item in items if not item.pinned]
+    if option.key is not None:
+        movable = sorted(movable, key=option.key)
+    if reverse:
+        movable.reverse()
+    ordered = iter(movable)
+    return [item if item.pinned else next(ordered) for item in items]
+
+
+class _Sorter:
+    """The items in their current order plus the active sort."""
+
+    def __init__(self, items: list[PickItem], sorts=None, choice: SortChoice | None = None):
+        self.base = list(items)
+        self.sorts = tuple(sorts or ())
+        labels = [s.label for s in self.sorts]
+        known = isinstance(choice, SortChoice) and choice.label in labels
+        self.index = labels.index(choice.label) if known else 0
+        self.reverse = bool(choice.reverse) if known else False
+        self.items = self._ordered()
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.sorts)
+
+    @property
+    def choice(self) -> SortChoice | None:
+        if not self.sorts:
+            return None
+        return SortChoice(self.sorts[self.index].label, self.reverse)
+
+    @property
+    def status(self) -> str:
+        if not self.sorts:
+            return ''
+        suffix = ' (reversed)' if self.reverse else ''
+        return f'sort: {self.sorts[self.index].label}{suffix}'
+
+    @property
+    def footer(self) -> str:
+        return f'{self.status} · {SORT_KEYS_HINT} · {FOOTER}' if self.sorts else FOOTER
+
+    def _ordered(self) -> list[PickItem]:
+        if not self.sorts:
+            return list(self.base)
+        return apply_sort(self.base, self.sorts[self.index], self.reverse)
+
+    def cycle(self) -> None:
+        if not self.sorts:
+            return
+        self.index = (self.index + 1) % len(self.sorts)
+        self.reverse = False
+        self.items = self._ordered()
+
+    def flip(self) -> None:
+        if not self.sorts:
+            return
+        self.reverse = not self.reverse
+        self.items = self._ordered()
 
 
 class _MenuState:
@@ -72,6 +152,17 @@ class _MenuState:
             self.top = self.index - VISIBLE_ROWS + 1
 
 
+def _position(items: list[PickItem], target: PickItem) -> int:
+    return next((index for index, item in enumerate(items) if item is target), 0)
+
+
+def _resort(state: _MenuState, sorter: _Sorter, action) -> None:
+    """Apply a sort change and keep the pointer on the same item."""
+    current = sorter.items[state.index]
+    action()
+    state.jump(_position(sorter.items, current))
+
+
 def _render_row(item: PickItem, selected: bool) -> list:
     if selected:
         row = [('class:pointer', ' ❯ '), ('class:selected', item.label)]
@@ -83,7 +174,7 @@ def _render_row(item: PickItem, selected: bool) -> list:
     return row
 
 
-def _render_menu(title: str, items: list[PickItem], state: _MenuState) -> list:
+def _render_menu(title: str, items: list[PickItem], state: _MenuState, footer: str = FOOTER) -> list:
     fragments = [('class:title', f' {title}\n')]
     scrolling = state.count > VISIBLE_ROWS
     end = min(state.count, state.top + VISIBLE_ROWS)
@@ -93,7 +184,7 @@ def _render_menu(title: str, items: list[PickItem], state: _MenuState) -> list:
         fragments.extend(_render_row(items[idx], idx == state.index))
     if scrolling:
         fragments.append(('class:dim', '   ↓ more\n' if end < state.count else '\n'))
-    fragments.append(('class:dim', f' {state.index + 1}/{state.count} · {FOOTER}'))
+    fragments.append(('class:dim', f' {state.index + 1}/{state.count} · {footer}'))
     return fragments
 
 
@@ -137,15 +228,29 @@ def _bind_actions(kb, state: _MenuState) -> None:
         event.app.exit(result=None)
 
 
-def _select_with_prompt_toolkit(title: str, items: list[PickItem], default_index: int) -> int | None:
+def _bind_sorting(kb, state: _MenuState, sorter: _Sorter) -> None:
+    if not sorter.enabled:
+        return
+
+    @kb.add('s')
+    def _sort(_event):
+        _resort(state, sorter, sorter.cycle)
+
+    @kb.add('r')
+    def _reverse(_event):
+        _resort(state, sorter, sorter.flip)
+
+
+def _select_with_prompt_toolkit(title: str, sorter: _Sorter, default_index: int) -> int | None:
     if not HAS_PROMPT_TOOLKIT or not (sys.stdin.isatty() and sys.stdout.isatty()):
         raise MenuUnavailable('interactive terminal unavailable')
-    state = _MenuState(len(items), default_index)
+    state = _MenuState(len(sorter.items), default_index)
     kb = KeyBindings()
     _bind_navigation(kb, state)
     _bind_actions(kb, state)
+    _bind_sorting(kb, state, sorter)
     control = FormattedTextControl(
-        lambda: _render_menu(title, items, state), focusable=True, show_cursor=False
+        lambda: _render_menu(title, sorter.items, state, sorter.footer), focusable=True, show_cursor=False
     )
     app = Application(
         layout=Layout(HSplit([Window(content=control, dont_extend_height=True, always_hide_cursor=True)])),
@@ -163,35 +268,58 @@ def _select_with_prompt_toolkit(title: str, items: list[PickItem], default_index
     return result if isinstance(result, int) else None
 
 
-def _select_numbered(title: str, items: list[PickItem]) -> int | None:
+def _print_numbered(title: str, sorter: _Sorter) -> None:
     rule(escape(title))
-    for idx, item in enumerate(items, start=1):
+    for idx, item in enumerate(sorter.items, start=1):
         hint = f'  [dim]{escape(item.hint)}[/dim]' if item.hint else ''
         console.print(f'  [cyan]{idx:2d}.[/cyan] {escape(item.label)}{hint}')
-    for _ in range(MAX_NUMBERED_ATTEMPTS):
+    if sorter.enabled:
+        console.print(f'  [dim]{escape(sorter.status)} · {SORT_KEYS_HINT}[/dim]')
+
+
+def _select_numbered(title: str, sorter: _Sorter) -> int | None:
+    _print_numbered(title, sorter)
+    keys = ', s sort, r reverse' if sorter.enabled else ''
+    prompt = f'\n[bold]Select # (q to quit{keys}): [/bold]'
+    count = len(sorter.items)
+    for _ in range(MAX_NUMBERED_ATTEMPTS + MAX_SORT_PRESSES):
         try:
-            answer = console.input('\n[bold]Select # (q to quit): [/bold]').strip()
+            answer = console.input(prompt).strip().lower()
         except (KeyboardInterrupt, EOFError):
             return None
-        if answer.lower() in ('q', 'quit', ''):
+        if answer in ('q', 'quit', ''):
             return None
-        if answer.isdigit() and 1 <= int(answer) <= len(items):
+        if sorter.enabled and answer in ('s', 'r'):
+            (sorter.cycle if answer == 's' else sorter.flip)()
+            _print_numbered(title, sorter)
+            continue
+        if answer.isdigit() and 1 <= int(answer) <= count:
             return int(answer) - 1
-        warn(f'Enter a number between 1 and {len(items)}, or q to quit.')
+        warn(f'Enter a number between 1 and {count}, or q to quit.')
     return None
 
 
-def pick(title: str, items: list[PickItem], default_index: int = 0) -> PickItem | None:
-    """Returns the chosen item, or None when cancelled or there is nothing to pick."""
+def pick(title: str, items: list[PickItem], default_index: int = 0, sorts=None,
+         sort_choice: SortChoice | None = None,
+         on_sort: Callable[[SortChoice], None] | None = None) -> PickItem | None:
+    """Returns the chosen item, or None when cancelled or there is nothing to pick.
+
+    With `sorts`, s/r change the order; on_sort receives the new choice when it changed.
+    """
     if not items:
         return None
+    sorter = _Sorter(items, sorts, sort_choice)
+    start = items[default_index] if 0 <= default_index < len(items) else items[0]
+    initial = sorter.choice
     try:
-        index = _select_with_prompt_toolkit(title, items, default_index)
+        index = _select_with_prompt_toolkit(title, sorter, _position(sorter.items, start))
     except MenuUnavailable:
-        index = _select_numbered(title, items)
-    if index is None or not 0 <= index < len(items):
+        index = _select_numbered(title, sorter)
+    if on_sort is not None and sorter.choice != initial:
+        on_sort(sorter.choice)
+    if index is None or not 0 <= index < len(sorter.items):
         return None
-    return items[index]
+    return sorter.items[index]
 
 
 def confirm(question: str, default: bool = False) -> bool:

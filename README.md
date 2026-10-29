@@ -49,6 +49,10 @@ Every new install (from Downloads, a 1-click link or `install --into`) is checke
 
 Disabled mods are not deleted. Their files are moved to `game/citadel/dlmm_disabled/<id>/`, where the game doesn't load them. Every VPK chosen from one archive belongs to one mod and is always switched as a unit.
 
+## Sorting
+
+Every list of mods can be re-sorted while it is open. Press `s` to cycle between character, newest download first and name, and press `r` to reverse the order. Your choice is remembered. The Downloads picker sorts by newest download or name. Use `list --sort character|time|name` to sort the printed list.
+
 ## Conflicts
 
 dlmm reads each VPK's internal file list. When two enabled mods that aren't in the same group replace the same game files, it shows which files overlap. You can then group the two mods, skip the pair for now, ignore it permanently, or stop checking.
